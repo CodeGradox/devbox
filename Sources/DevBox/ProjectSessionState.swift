@@ -177,6 +177,26 @@ final class ProjectSessionState {
 
     func invalidateInventory() { hasLoadedInventory = false }
 
+    /// Apply confirmed deletions to the snapshot without scheduling any fresh I/O.
+    func removeConfirmedWorktrees(ids: Set<String>) {
+        let removed = rows.filter { ids.contains($0.id) }
+        guard !removed.isEmpty else { return }
+        let paths = Set(removed.map { $0.row.worktree.canonicalPath })
+        for state in removed { byID.removeValue(forKey: state.id) }
+        rows.removeAll { ids.contains($0.id) }
+        for state in rows {
+            state.update {
+                // Removing a nested checkout does not change its parent's exclusive
+                // measurement: that subtree was already excluded from the cached size.
+                $0.worktree = $0.worktree.removingNestedWorktrees(at: paths)
+            }
+        }
+        // Shared Git storage, status, branch snapshots, errors and timestamps remain
+        // last-known values until Refresh. Recompute rather than blindly subtract:
+        // missing/partial measurements and overflow must still be represented correctly.
+        refreshSummary()
+    }
+
     func pauseScans() {
         performBatchUpdates {
             for state in rows where state.row.isSizeBusy {

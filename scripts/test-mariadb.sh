@@ -49,5 +49,12 @@ done
     --user=root --skip-password --default-character-set=utf8mb4 <<'SQL'
 CREATE DATABASE `devbox_integration_plain`;
 CREATE DATABASE `devbox_integration_``資料`;
+CREATE DATABASE `devbox_integration_empty`;
+CREATE TABLE `devbox_integration_plain`.`records` (id INT PRIMARY KEY) ENGINE=MyISAM;
+INSERT INTO `devbox_integration_plain`.`records` VALUES (1), (2), (3);
+CREATE VIEW `devbox_integration_plain`.`view_``資料` AS SELECT * FROM `devbox_integration_plain`.`records`;
+CREATE TABLE `devbox_integration_``資料`.`history_``資料` (id INT PRIMARY KEY) ENGINE=InnoDB WITH SYSTEM VERSIONING;
+CREATE USER 'devbox_metadata_reader'@'localhost' IDENTIFIED BY '';
+GRANT SELECT ON `devbox_integration_plain`.`records` TO 'devbox_metadata_reader'@'localhost';
 SQL
 DEVBOX_TEST_MARIADB_SOCKET="$socket" swift test --filter 'Database(Service|Integration)Tests'

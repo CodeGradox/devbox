@@ -1,0 +1,91 @@
+name: macOS ad hoc builds
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test and package ${{ matrix.arch }} (ad hoc, non-notarized)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            arch: arm64
+          - runner: macos-26-intel
+            arch: x86_64
+    env:
+      CONFIGURATION: release
+      DEVBOX_SIGNING_IDENTITY: '-'
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Isolate build outputs
+        run: |
+          echo "BUILD_DIR=$RUNNER_TEMP/devbox-app" >> "$GITHUB_ENV"
+          echo "SWIFT_BUILD_PATH=$RUNNER_TEMP/devbox-swift" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify native architecture and toolchain
+        run: |
+          test "$(uname -m)" = "$ARCH"
+          xcodebuild -version
+          swift --version
+          python3 - <<'PY'
+          import re, subprocess
+          swift = subprocess.check_output(["swift", "--version"], text=True)
+          version = tuple(map(int, re.search(r"Swift version (\d+)\.(\d+)", swift).groups()))
+          assert version >= (6, 2), swift
+          sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True).strip()
+          assert int(sdk.split(".")[0]) >= 26, sdk
+          PY
+      - name: Test without database integration
+        run: |
+          unset DEVBOX_TEST_MARIADB_SOCKET
+          swift test --scratch-path "$SWIFT_BUILD_PATH"
+      - name: Build release app
+        run: sh scripts/build-app.sh
+      - name: Verify and archive app and executable
+        run: |
+          app="$BUILD_DIR/DevBox.app"
+          binary="$app/Contents/MacOS/DevBox"
+          test "$(lipo -archs "$binary")" = "$ARCH"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 26.0
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")" = DevBox
+          test -s "$app/Contents/Resources/DevBox.icns"
+          xcrun vtool -show-build "$binary"
+          xcrun vtool -show-build "$binary" | grep -Eq 'minos[[:space:]]+26\.0([[:space:]]|$)'
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$app" 2>&1 | grep -F 'Signature=adhoc'
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent "$app" "artifacts/DevBox-macos26-$ARCH-adhoc-non-notarized-app.zip"
+          # A bundle's executable signature binds Info.plist. Re-sign only a
+          # separate copy so the standalone download is independently valid.
+          standalone="$RUNNER_TEMP/devbox-standalone"
+          mkdir -p "$standalone"
+          cp "$binary" "$standalone/DevBox"
+          codesign --force --sign - "$standalone/DevBox"
+          codesign --verify --strict "$standalone/DevBox"
+          ditto -c -k "$standalone" "artifacts/DevBox-macos26-$ARCH-adhoc-non-notarized-executable.zip"
+          ditto -x -k "artifacts/DevBox-macos26-$ARCH-adhoc-non-notarized-executable.zip" "$RUNNER_TEMP/standalone-roundtrip"
+          test -x "$RUNNER_TEMP/standalone-roundtrip/DevBox"
+          codesign --verify --strict "$RUNNER_TEMP/standalone-roundtrip/DevBox"
+          codesign --verify --strict "$app"
+          (cd artifacts && shasum -a 256 ./*.zip > SHA256SUMS.txt)
+      - name: Upload ad hoc, non-notarized downloads
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DevBox-macos26-${{ matrix.arch }}-adhoc-non-notarized
+          path: artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

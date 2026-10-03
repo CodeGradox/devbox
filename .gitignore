@@ -2,3 +2,39 @@
 .swiftpm/
 build/
 .DS_Store
+/Resources/icon-opt.*/
+
+# Local environment files (only sanitized examples belong in Git).
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Exported private keys, signing identities, and local credential stores.
+*.key
+*.pem
+*.p8
+*.p12
+*.pfx
+*.keychain
+*.keychain-db
+*.mobileprovision
+*.provisionprofile
+/secrets/
+/credentials/
+
+# Local database exports, database files, and diagnostic logs.
+/dumps/
+/backups/
+*.sql
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+*.dump
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.log

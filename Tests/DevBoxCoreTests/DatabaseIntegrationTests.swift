@@ -27,7 +27,31 @@ final class DatabaseIntegrationTests: XCTestCase {
         try await service.testConnection(settings: settings, password: "")
         let before = try await service.databases(settings: settings, password: "")
         XCTAssertEqual(before.map(\.name), before.map(\.name).sorted())
-        for name in ["devbox_integration_plain", "devbox_integration_`資料"] {
+        let statistics = try await service.databaseStatistics(settings: settings, password: "")
+        XCTAssertEqual(Set(statistics.keys), Set(before.map(\.name)))
+        let plain = try XCTUnwrap(statistics["devbox_integration_plain"])
+        XCTAssertEqual(plain.tableCount, 1)
+        XCTAssertEqual(plain.viewCount, 1)
+        XCTAssertEqual(plain.estimatedRows, 3) // MyISAM fixture reports exact metadata.
+        XCTAssertGreaterThan(try XCTUnwrap(plain.dataBytes), 0)
+        XCTAssertGreaterThan(try XCTUnwrap(plain.indexBytes), 0)
+        XCTAssertEqual(plain.totalBytes, try XCTUnwrap(plain.dataBytes) + XCTUnwrap(plain.indexBytes))
+        XCTAssertEqual(statistics["devbox_integration_`資料"]?.tableCount, 1)
+        XCTAssertEqual(statistics["devbox_integration_`資料"]?.viewCount, 0)
+        XCTAssertEqual(statistics["devbox_integration_empty"],
+                       .init(tableCount: 0, viewCount: 0, estimatedRows: 0, dataBytes: 0, indexBytes: 0))
+
+        // Permissions hide the view and other schemas rather than fabricating totals.
+        let restricted = try await service.databaseStatistics(
+            settings: .init(username: "devbox_metadata_reader", socketPath: socket), password: ""
+        )
+        XCTAssertEqual(restricted["devbox_integration_plain"]?.tableCount, 1)
+        XCTAssertEqual(restricted["devbox_integration_plain"]?.viewCount, 0)
+        XCTAssertEqual(restricted["devbox_integration_plain"]?.estimatedRows, 3)
+        XCTAssertNil(restricted["devbox_integration_empty"])
+        XCTAssertNil(restricted["devbox_integration_`資料"])
+
+        for name in ["devbox_integration_plain", "devbox_integration_`資料", "devbox_integration_empty"] {
             XCTAssertTrue(before.contains(.init(name: name)), "Missing fixture \(name)")
             try await service.dropDatabase(.init(name: name), settings: settings, password: "")
         }

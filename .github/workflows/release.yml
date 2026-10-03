@@ -1,0 +1,90 @@
+name: Manual Developer ID notarized apps
+run-name: Notarized arm64 and x86_64 apps from trusted main
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # No user-supplied ref input: only reviewed main may access credentials.
+    if: github.ref == 'refs/heads/main'
+    name: Sign and notarize ${{ matrix.arch }}
+    environment: release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            arch: arm64
+          - runner: macos-26-intel
+            arch: x86_64
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Isolate build outputs
+        run: |
+          echo "BUILD_DIR=$RUNNER_TEMP/devbox-release" >> "$GITHUB_ENV"
+          echo "SWIFT_BUILD_PATH=$RUNNER_TEMP/devbox-swift" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check native toolchain and test before importing secrets
+        run: |
+          test "$(uname -m)" = "$ARCH"
+          xcodebuild -version
+          swift --version
+          python3 - <<'PY'
+          import re, subprocess
+          swift = subprocess.check_output(["swift", "--version"], text=True)
+          version = tuple(map(int, re.search(r"Swift version (\d+)\.(\d+)", swift).groups()))
+          assert version >= (6, 2), swift
+          sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True).strip()
+          assert int(sdk.split(".")[0]) >= 26, sdk
+          PY
+          unset DEVBOX_TEST_MARIADB_SOCKET
+          swift test --scratch-path "$SWIFT_BUILD_PATH"
+      - name: Import ephemeral identity, sign, notarize and staple
+        env:
+          DEVBOX_CERTIFICATE_BASE64: ${{ secrets.DEVBOX_CERTIFICATE_BASE64 }}
+          DEVBOX_CERTIFICATE_PASSWORD: ${{ secrets.DEVBOX_CERTIFICATE_PASSWORD }}
+          DEVBOX_SIGNING_IDENTITY: ${{ secrets.DEVBOX_SIGNING_IDENTITY }}
+          DEVBOX_NOTARY_KEY_BASE64: ${{ secrets.DEVBOX_NOTARY_KEY_BASE64 }}
+          DEVBOX_NOTARY_KEY_ID: ${{ secrets.DEVBOX_NOTARY_KEY_ID }}
+          DEVBOX_NOTARY_ISSUER_ID: ${{ secrets.DEVBOX_NOTARY_ISSUER_ID }}
+        run: sh scripts/notarize-app.sh
+      - name: Verify and package stapled app
+        run: |
+          app="$BUILD_DIR/DevBox.app"
+          binary="$app/Contents/MacOS/DevBox"
+          test "$(lipo -archs "$binary")" = "$ARCH"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 26.0
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")" = DevBox
+          test -s "$app/Contents/Resources/DevBox.icns"
+          xcrun vtool -show-build "$binary"
+          xcrun vtool -show-build "$binary" | grep -Eq 'minos[[:space:]]+26\.0([[:space:]]|$)'
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          mkdir -p artifacts
+          ditto -c -k --sequesterRsrc --keepParent "$app" "artifacts/DevBox-macos26-$ARCH-developer-id-notarized-app.zip"
+          (cd artifacts && shasum -a 256 ./*.zip > SHA256SUMS.txt)
+      - name: Remove any remaining ephemeral credentials
+        if: always()
+        run: |
+          for directory in "$RUNNER_TEMP"/devbox-signing.*; do
+            test -d "$directory" || continue
+            security delete-keychain "$directory/release.keychain-db" >/dev/null 2>&1 || true
+            rm -rf "$directory"
+          done
+      - name: Upload notarized app (does not publish a GitHub Release)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: DevBox-macos26-${{ matrix.arch }}-developer-id-notarized
+          path: artifacts/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

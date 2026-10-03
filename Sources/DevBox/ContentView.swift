@@ -17,8 +17,8 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 if let project = store.selectedProject, let session = store.selectedProjectSession {
                     WorktreesView(project: project, session: session)
-                } else if let connection = store.selectedConnection {
-                    DatabasesView(connection: connection)
+                } else if let connection = store.selectedConnection, let session = store.selectedDatabaseSession {
+                    DatabasesView(connection: connection, session: session)
                 } else {
                     WelcomeView()
                 }
@@ -62,7 +62,7 @@ private struct WorkspaceToolbar: ToolbarContent {
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
-                .help("Refresh status and disk usage (⌘R)")
+                .help("Refresh status, sizes, and database statistics (⌘R)")
                 .disabled(store.isRefreshing || store.isDeleting)
                 Button(role: .destructive) {
                     store.prepareDeletion()
@@ -410,66 +410,7 @@ struct WorktreeDiskUsageCell: View {
     }
 }
 
-struct DatabasesView: View {
-    @Environment(AppStore.self) private var store
-    let connection: SavedConnection
-
-    var body: some View {
-        @Bindable var store = store
-        VStack(spacing: 0) {
-            DetailHeader(title: "Databases", subtitle: endpoint, symbol: "externaldrive") {
-                Button("Connection Settings…") {
-                    store.connectionEditor = .init(connection: connection)
-                }
-                .disabled(store.isDeleting)
-            }
-            if let error = store.loadError {
-                LoadErrorView(message: error, retry: store.refresh)
-            } else {
-                Table(store.databases, selection: $store.databaseSelection) {
-                    TableColumn("Database") { database in
-                        Label(database.name, systemImage: "externaldrive")
-                            .fontWeight(.medium)
-                            .padding(.vertical, 6)
-                    }
-                    TableColumn("Type") { database in
-                        if database.isSystem {
-                            Label("System · Protected", systemImage: "lock")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Text("User database").foregroundStyle(.secondary)
-                        }
-                    }
-                    .width(min: 150, ideal: 180, max: 230)
-                }
-                .overlay {
-                    if store.isRefreshing {
-                        ProgressView("Connecting…")
-                    } else if store.databases.isEmpty {
-                        ContentUnavailableView("No Databases", systemImage: "externaldrive", description: Text("This account has no visible databases."))
-                    }
-                }
-            }
-            StatusFooter {
-                if store.selectedDatabases.contains(where: \.isSystem) {
-                    Label("System databases cannot be deleted", systemImage: "lock")
-                } else if !store.databaseSelection.isEmpty {
-                    Text("\(store.databaseSelection.count) selected")
-                } else {
-                    Text("\(store.databases.count) databases · Local connection")
-                }
-            }
-        }
-    }
-
-    private var endpoint: String {
-        connection.settings.socketPath.isEmpty
-            ? "\(connection.settings.username)@\(connection.settings.host):\(connection.settings.port)"
-            : "\(connection.settings.username) · \(connection.settings.socketPath)"
-    }
-}
-
-private struct DetailHeader<Accessory: View>: View {
+struct DetailHeader<Accessory: View>: View {
     let title: String
     let subtitle: String
     let symbol: String
@@ -502,7 +443,7 @@ private struct DetailHeader<Accessory: View>: View {
     }
 }
 
-private struct StatusFooter<Content: View>: View {
+struct StatusFooter<Content: View>: View {
     @Environment(AppStore.self) private var store
     let session: ProjectSessionState?
     let content: Content
@@ -533,7 +474,7 @@ private struct StatusFooter<Content: View>: View {
     }
 }
 
-private struct LoadErrorView: View {
+struct LoadErrorView: View {
     let message: String
     let retry: () -> Void
 

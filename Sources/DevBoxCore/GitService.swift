@@ -20,6 +20,8 @@ public struct ProjectRecord: Codable, Hashable, Identifiable, Sendable {
 public struct WorktreeRecord: Identifiable, Hashable, Sendable {
     public var id: String { path }
     public let path: String
+    /// Resolved once during discovery, for matching cached nested boundaries without I/O.
+    public let canonicalPath: String
     public let branch: String?
     public let head: String
     public let isMain: Bool
@@ -35,9 +37,10 @@ public struct WorktreeRecord: Identifiable, Hashable, Sendable {
         path: String, branch: String?, head: String, isMain: Bool,
         isBare: Bool = false, isLocked: Bool = false, lockReason: String? = nil,
         isPrunable: Bool = false, pruneReason: String? = nil, exists: Bool = true,
-        nestedWorktreePaths: [String] = []
+        nestedWorktreePaths: [String] = [], canonicalPath: String? = nil
     ) {
         self.path = path
+        self.canonicalPath = canonicalPath ?? path
         self.branch = branch
         self.head = head
         self.isMain = isMain
@@ -48,6 +51,17 @@ public struct WorktreeRecord: Identifiable, Hashable, Sendable {
         self.pruneReason = pruneReason
         self.exists = exists
         self.nestedWorktreePaths = nestedWorktreePaths
+    }
+
+    public func removingNestedWorktrees(at paths: Set<String>) -> Self {
+        let remaining = nestedWorktreePaths.filter { !paths.contains($0) }
+        guard remaining != nestedWorktreePaths else { return self }
+        return Self(
+            path: path, branch: branch, head: head, isMain: isMain,
+            isBare: isBare, isLocked: isLocked, lockReason: lockReason,
+            isPrunable: isPrunable, pruneReason: pruneReason, exists: exists,
+            nestedWorktreePaths: remaining, canonicalPath: canonicalPath
+        )
     }
 }
 
@@ -229,7 +243,7 @@ public struct GitService: Sendable {
                 path: record.path, branch: record.branch, head: record.head, isMain: record.isMain,
                 isBare: record.isBare, isLocked: record.isLocked, lockReason: record.lockReason,
                 isPrunable: record.isPrunable, pruneReason: record.pruneReason, exists: record.exists,
-                nestedWorktreePaths: nested
+                nestedWorktreePaths: nested, canonicalPath: roots[index]
             )
         }
     }

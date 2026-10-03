@@ -32,6 +32,80 @@ public struct DatabaseRecord: Identifiable, Hashable, Sendable {
     }
 }
 
+/// Statistics for objects visible to the connected account, not filesystem usage.
+/// Rows and InnoDB sizes are server estimates. DATA_LENGTH/INDEX_LENGTH are
+/// server-reported bytes (MEMORY can report memory), not reclaimable disk space.
+/// Shared-tablespace DATA_FREE is deliberately excluded.
+public struct DatabaseStatistics: Equatable, Sendable {
+    public let tableCount: Int64
+    public let viewCount: Int64
+    public let estimatedRows: Int64?
+    public let dataBytes: Int64?
+    public let indexBytes: Int64?
+
+    public init(tableCount: Int64, viewCount: Int64, estimatedRows: Int64?, dataBytes: Int64?, indexBytes: Int64?) {
+        self.tableCount = tableCount
+        self.viewCount = viewCount
+        self.estimatedRows = estimatedRows
+        self.dataBytes = dataBytes
+        self.indexBytes = indexBytes
+    }
+
+    public var totalBytes: Int64? {
+        Self.add(dataBytes, indexBytes)
+    }
+
+    static func add(_ lhs: Int64?, _ rhs: Int64?) -> Int64? {
+        guard let lhs, let rhs else { return nil }
+        let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? nil : sum
+    }
+
+    static func nonnegativeInteger(_ text: String?) -> Int64? {
+        guard let text, !text.isEmpty,
+              text.utf8.allSatisfy({ (48...57).contains($0) }) else { return nil }
+        return Int64(text)
+    }
+
+    /// A NULL table name is the LEFT JOIN placeholder for an empty visible schema.
+    static func accumulate(_ row: [String?], into values: inout [String: Self]) throws {
+        guard row.count == 6, let schema = row[0], !schema.isEmpty else {
+            throw DatabaseServiceError.invalidResult
+        }
+        let old = values[schema] ?? Self(tableCount: 0, viewCount: 0, estimatedRows: 0, dataBytes: 0, indexBytes: 0)
+        guard row[1] != nil else {
+            values[schema] = old
+            return
+        }
+        guard let type = row[2] else { throw DatabaseServiceError.invalidResult }
+        let table = type == "BASE TABLE" || type == "SYSTEM VERSIONED"
+        let view = type == "VIEW" || type == "SYSTEM VIEW"
+        let sequence = type == "SEQUENCE"
+        guard let tables = add(old.tableCount, table ? 1 : 0),
+              let views = add(old.viewCount, view ? 1 : 0) else {
+            throw DatabaseServiceError.invalidResult
+        }
+        var rows = old.estimatedRows
+        var data = old.dataBytes
+        var indexes = old.indexBytes
+        if table { rows = add(rows, nonnegativeInteger(row[3])) }
+        if table || sequence {
+            // Sequences have storage, but their implementation row is not user data.
+            data = add(data, nonnegativeInteger(row[4]))
+            indexes = add(indexes, nonnegativeInteger(row[5]))
+        } else if !view {
+            // Unknown storage-bearing types must not silently imply zero usage.
+            rows = nil
+            data = nil
+            indexes = nil
+        }
+        values[schema] = Self(
+            tableCount: tables, viewCount: views,
+            estimatedRows: rows, dataBytes: data, indexBytes: indexes
+        )
+    }
+}
+
 public enum DatabaseServiceError: LocalizedError, Sendable {
     case invalidSettings(String)
     case invalidIdentifier
@@ -116,6 +190,50 @@ public struct DatabaseService: Sendable {
                     throw api.error("Reading databases", connection)
                 }
                 return databases.sorted { $0.name < $1.name }
+            }
+        }
+    }
+
+    /// One read-only metadata query for every visible schema. Missing, malformed,
+    /// negative or overflowing table metrics make that metric unknown for its schema.
+    /// Empty visible schemas have zero counts and bytes; permissions can hide objects.
+    public func databaseStatistics(settings: ConnectionSettings, password: String) async throws -> [String: DatabaseStatistics] {
+        try Self.validate(settings: settings, password: password)
+        return try await Self.perform { cancellation in
+            try Self.withConnection(settings: settings, password: password, cancellation: cancellation) { api, connection in
+                try cancellation.check()
+                try api.execute("""
+                    SELECT s.SCHEMA_NAME, t.TABLE_NAME, t.TABLE_TYPE,
+                           t.TABLE_ROWS, t.DATA_LENGTH, t.INDEX_LENGTH
+                    FROM INFORMATION_SCHEMA.SCHEMATA AS s
+                    LEFT JOIN INFORMATION_SCHEMA.TABLES AS t
+                      ON BINARY t.TABLE_SCHEMA = BINARY s.SCHEMA_NAME
+                    """, connection: connection)
+                guard let result = api.storeResult(connection) else {
+                    throw api.error("Loading database statistics", connection)
+                }
+                defer { api.freeResult(result) }
+                var statistics: [String: DatabaseStatistics] = [:]
+                while let row = api.fetchRow(result) {
+                    try cancellation.check()
+                    guard let lengths = api.fetchLengths(result) else {
+                        throw DatabaseServiceError.invalidResult
+                    }
+                    let fields: [String?] = try (0..<6).map { index in
+                        guard let bytes = row[index] else { return nil }
+                        guard let count = Int(exactly: lengths[index]),
+                              let value = String(data: Data(bytes: bytes, count: count), encoding: .utf8) else {
+                            throw DatabaseServiceError.invalidResult
+                        }
+                        return value
+                    }
+                    try DatabaseStatistics.accumulate(fields, into: &statistics)
+                }
+                guard api.errorNumber(connection) == 0 else {
+                    throw api.error("Reading database statistics", connection)
+                }
+                try cancellation.check()
+                return statistics
             }
         }
     }

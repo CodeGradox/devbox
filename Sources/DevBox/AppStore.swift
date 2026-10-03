@@ -15,7 +15,7 @@ enum SizeScanState {
 }
 
 struct WorktreeRow: Identifiable {
-    let worktree: WorktreeRecord
+    var worktree: WorktreeRecord
     var status: GitStatus?
     var statusError: String?
     var statusRefreshPending = false
@@ -71,6 +71,7 @@ struct DeletionRequest: Identifiable {
     }
     let id = UUID()
     let items: Items
+    var statisticsSummary: String?
     var count: Int {
         switch items {
         case .worktrees(_, let rows): rows.count
@@ -121,6 +122,8 @@ struct OperationResult: Identifiable {
         var id: String { name }
         let name: String
         var state: DeletionState = .queued
+        var startedAt: Date?
+        var elapsed: TimeInterval?
     }
 }
 
@@ -150,7 +153,7 @@ final class AppStore {
         }
     }
     private(set) var selectedProjectSession: ProjectSessionState?
-    private(set) var databases: [DatabaseRecord] = []
+    private(set) var selectedDatabaseSession: DatabaseSessionState?
     var worktreeSelection: Set<String> = []
     var databaseSelection: Set<String> = []
     private(set) var isRefreshing = false
@@ -166,6 +169,7 @@ final class AppStore {
     // Operations use value snapshots; table cells observe stable row objects.
     var worktrees: [WorktreeRow] { selectedProjectSession?.snapshots ?? [] }
     var projectOverview: ProjectOverview { selectedProjectSession?.overview ?? ProjectOverview() }
+    var databases: [DatabaseRecord] { selectedDatabaseSession?.records ?? [] }
 
     let git = GitService()
     let databaseService = DatabaseService()
@@ -173,6 +177,9 @@ final class AppStore {
     private let credentials: any CredentialsPersisting
     private let authenticate: @MainActor (String) async throws -> Void
     private let dropDatabase: @Sendable (DatabaseRecord, ConnectionSettings, String) async throws -> Void
+    private let removeWorktree: @Sendable (WorktreeRecord, ProjectRecord) async throws -> Void
+    private let listDatabases: @Sendable (ConnectionSettings, String) async throws -> [DatabaseRecord]
+    private let loadStatistics: @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics]
     private let sizeQueue: WorktreeSizeQueue
     private let inspectBranches: @Sendable (ProjectRecord, [WorktreeRecord]) async throws -> BranchInspection
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
@@ -182,6 +189,7 @@ final class AppStore {
     private var queuedSheet: AppSheet?
     // The session models are the cache, not duplicate active/cache arrays.
     private var projectSessions: [String: ProjectSessionState] = [:]
+    private var databaseSessions: [UUID: DatabaseSessionState] = [:]
 
     var deletionRequest: DeletionRequest? {
         get {
@@ -217,6 +225,15 @@ final class AppStore {
         dropDatabase: @escaping @Sendable (DatabaseRecord, ConnectionSettings, String) async throws -> Void = {
             try await DatabaseService().dropDatabase($0, settings: $1, password: $2)
         },
+        removeWorktree: @escaping @Sendable (WorktreeRecord, ProjectRecord) async throws -> Void = {
+            try await GitService().remove(worktree: $0, project: $1, allowDirty: true)
+        },
+        listDatabases: @escaping @Sendable (ConnectionSettings, String) async throws -> [DatabaseRecord] = {
+            try await DatabaseService().databases(settings: $0, password: $1)
+        },
+        loadStatistics: @escaping @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics] = {
+            try await DatabaseService().databaseStatistics(settings: $0, password: $1)
+        },
         authenticate: @escaping @MainActor (String) async throws -> Void = { reason in
             try await OwnerAuthentication.authorize(reason: reason)
         }
@@ -226,11 +243,17 @@ final class AppStore {
         self.sizeQueue = sizeQueue
         self.inspectBranches = inspectBranches
         self.dropDatabase = dropDatabase
+        self.removeWorktree = removeWorktree
+        self.listDatabases = listDatabases
+        self.loadStatistics = loadStatistics
         self.authenticate = authenticate
         do {
             settings = try persistence.load()
             projectSessions = Dictionary(uniqueKeysWithValues: settings.projects.map {
                 ($0.id, ProjectSessionState())
+            })
+            databaseSessions = Dictionary(uniqueKeysWithValues: settings.connections.map {
+                ($0.id, DatabaseSessionState())
             })
             if let first = settings.projects.first {
                 destination = .project(first.id)
@@ -273,6 +296,7 @@ final class AppStore {
 
     func refreshPresentations() {
         for session in projectSessions.values { session.refreshPresentation() }
+        for session in databaseSessions.values { session.refreshPresentation() }
     }
 
     func sizeSummary(for project: ProjectRecord) -> ProjectSizeSummary? {
@@ -289,6 +313,7 @@ final class AppStore {
             let selection = selectedWorktrees
             return !selection.isEmpty && selection.allSatisfy { $0.protectedReason == nil }
         }
+        guard selectedDatabaseSession?.hasLoadedInventory == true else { return false }
         return !selectedDatabases.isEmpty && selectedDatabases.allSatisfy { !$0.isSystem }
     }
 
@@ -360,6 +385,8 @@ final class AppStore {
             }
             throw settingsError
         }
+        // A changed endpoint or credential must never reuse the old server's metadata.
+        databaseSessions[connection.id] = DatabaseSessionState()
         destination = .connection(connection.id)
         refresh()
     }
@@ -369,8 +396,9 @@ final class AppStore {
             var next = settings
             next.connections.removeAll { $0.id == connection.id }
             try persist(next)
-            try credentials.remove(for: connection.id)
+            databaseSessions.removeValue(forKey: connection.id)
             if destination == .connection(connection.id) { destination = nil }
+            try credentials.remove(for: connection.id)
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -380,6 +408,9 @@ final class AppStore {
         settings = next
         for project in next.projects where projectSessions[project.id] == nil {
             projectSessions[project.id] = ProjectSessionState()
+        }
+        for connection in next.connections where databaseSessions[connection.id] == nil {
+            databaseSessions[connection.id] = DatabaseSessionState()
         }
     }
 
@@ -399,7 +430,7 @@ final class AppStore {
         refresh(useCache: true)
     }
 
-    /// Explicit refresh, including after deletion, always reads the repository again.
+    /// Explicit refresh reloads inventory and measurements; deletion only updates the cache.
     func refresh() {
         refresh(useCache: false)
     }
@@ -432,6 +463,7 @@ final class AppStore {
         branchTask?.cancel()
         sizeQueue.cancelAll()
         selectedProjectSession?.pauseScans()
+        selectedDatabaseSession?.pauseStatistics()
         let token = UUID()
         generation = token
         loadError = nil
@@ -440,9 +472,28 @@ final class AppStore {
         let connection = selectedConnection
         let session = project.flatMap { projectSessions[$0.id] }
         if selectedProjectSession !== session { selectedProjectSession = session }
-        databases = []
+        let databaseSession = connection.flatMap { databaseSessions[$0.id] }
+        if selectedDatabaseSession !== databaseSession { selectedDatabaseSession = databaseSession }
         guard destination != nil else {
             isRefreshing = false
+            return
+        }
+        if useCache, let connection, let databaseSession, databaseSession.hasLoadedInventory {
+            isRefreshing = false
+            guard databaseSession.needsStatisticsLoad else {
+                refreshTask = nil
+                return
+            }
+            refreshTask = Task {
+                guard generation == token, !Task.isCancelled else { return }
+                do {
+                    let secret = try password(for: connection.id)
+                    await loadDatabaseStatistics(connection, session: databaseSession, password: secret, token: token)
+                } catch {
+                    guard generation == token, !Task.isCancelled else { return }
+                    databaseSession.failStatistics(error.localizedDescription)
+                }
+            }
             return
         }
         if useCache, let session, session.hasLoadedInventory {
@@ -473,6 +524,7 @@ final class AppStore {
         // Preserve current content and identities while the new inventory loads.
         // A failed load invalidates reuse but doesn't destroy the visible snapshot.
         session?.invalidateInventory()
+        databaseSession?.invalidateInventory()
         isRefreshing = true
         progressText = "Refreshing…"
         refreshTask = Task {
@@ -501,24 +553,47 @@ final class AppStore {
                     }
                     progressText = "Refreshing Git status…"
                     await loadGitStatuses(records, token: token)
-                } else if let connection {
+                } else if let connection, let databaseSession {
                     let password = try password(for: connection.id)
-                    let records = try await databaseService.databases(settings: connection.settings, password: password)
+                    let records = try await listDatabases(connection.settings, password)
                     guard generation == token, !Task.isCancelled else { return }
-                    databases = records
+                    databaseSession.reconcile(records)
                     databaseSelection.formIntersection(Set(records.map(\.id)))
+                    // The inventory is usable immediately; slow metadata does not hide
+                    // the table or block selection/deletion behind a connecting overlay.
+                    finishRefresh(token: token)
+                    await loadDatabaseStatistics(connection, session: databaseSession, password: password, token: token)
                 }
             } catch {
                 guard generation == token, !Task.isCancelled else { return }
                 loadError = error.localizedDescription
+                databaseSession?.failStatistics(
+                    "The database list could not be refreshed. \(error.localizedDescription)"
+                )
             }
+        }
+    }
+
+    private func loadDatabaseStatistics(
+        _ connection: SavedConnection, session: DatabaseSessionState, password: String, token: UUID
+    ) async {
+        guard generation == token, !Task.isCancelled else { return }
+        session.beginStatistics()
+        do {
+            let statistics = try await loadStatistics(connection.settings, password)
+            guard generation == token, !Task.isCancelled else { return }
+            session.receive(statistics)
+        } catch {
+            guard generation == token, !Task.isCancelled else { return }
+            session.failStatistics(error.localizedDescription)
         }
     }
 
     private func finishRefresh(token: UUID) {
         guard generation == token else { return }
         isRefreshing = false
-        progressText = ""
+        // Metadata may finish while a deletion is active; it does not own that progress.
+        if !isDeleting { progressText = "" }
     }
 
     private func loadGitStatuses(_ records: [WorktreeRecord], token: UUID) async {
@@ -647,13 +722,20 @@ final class AppStore {
             for id in ids { updateRow(id) { $0.sizeState = .idle } }
             deletionRequest = DeletionRequest(items: .worktrees(project, selectedWorktrees))
         } else if let connection = selectedConnection {
-            deletionRequest = DeletionRequest(items: .databases(connection, selectedDatabases))
+            deletionRequest = DeletionRequest(
+                items: .databases(connection, selectedDatabases),
+                statisticsSummary: selectedDatabaseSession?.selectedSummary(databaseSelection).text
+            )
         }
     }
 
     func deletionState(for name: String, in request: DeletionRequest) -> DeletionState {
-        guard deletionBatchID == request.id else { return .queued }
-        return deletionEntries.first { $0.name == name }?.state ?? .queued
+        deletionEntry(for: name, in: request).state
+    }
+
+    func deletionEntry(for name: String, in request: DeletionRequest) -> OperationResult.Entry {
+        guard deletionBatchID == request.id else { return .init(name: name) }
+        return deletionEntries.first { $0.name == name } ?? .init(name: name)
     }
 
     func delete(_ request: DeletionRequest) async {
@@ -675,7 +757,7 @@ final class AppStore {
         switch request.items {
         case .worktrees(let project, let rows):
             await runDeletionBatch { index in
-                try await git.remove(worktree: rows[index].worktree, project: project, allowDirty: true)
+                try await removeWorktree(rows[index].worktree, project)
             }
         case .databases(let connection, let rows):
             do {
@@ -689,18 +771,32 @@ final class AppStore {
                 }
             }
         }
+        let completed = Set(deletionEntries.filter { $0.state == .completed }.map(\.id))
+        switch request.items {
+        case .worktrees(let project, _):
+            sizeQueue.cancel(worktreeIDs: completed)
+            projectSessions[project.id]?.removeConfirmedWorktrees(ids: completed)
+        case .databases(let connection, _):
+            databaseSessions[connection.id]?.removeConfirmedDatabases(ids: completed)
+        }
         progressText = ""
         worktreeSelection = []
         databaseSelection = []
         queuedSheet = .results(.init(title: "Deletion Results", entries: deletionEntries))
         deletionRequest = nil
         isDeleting = false
-        refresh()
     }
 
     private func runDeletionBatch(_ operation: @MainActor (Int) async throws -> Void) async {
         // Deliberately sequential: the next item is submitted only after this await.
         for index in deletionEntries.indices {
+            let clock = ContinuousClock()
+            let start = clock.now
+            deletionEntries[index].startedAt = Date()
+            defer {
+                let duration = start.duration(to: clock.now).components
+                deletionEntries[index].elapsed = Double(duration.seconds) + Double(duration.attoseconds) / 1e18
+            }
             deletionEntries[index].state = .deleting
             progressText = "Deleting \(index + 1) of \(deletionEntries.count): \(deletionEntries[index].name)"
             do {

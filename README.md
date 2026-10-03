@@ -49,6 +49,37 @@ again. `make test` does not require the app's signing certificate.
 The local self-signed certificate is not a distribution identity. Sharing a trusted,
 notarized app still requires an Apple-issued Developer ID certificate and notarization.
 
+### GitHub Actions builds
+
+The [macOS build workflow](.github/workflows/build.yml) tests and packages native
+Apple Silicon and Intel apps on macOS 26. Download the architecture-specific ZIP
+from a successful run's **Artifacts** section. These CI builds are explicitly
+ad-hoc signed, not notarized, and need no signing secrets.
+
+For trusted public downloads, use the optional signed-release workflow and follow
+[the GitHub signing setup](docs/github-releases.md). You need an **Apple-issued
+Developer ID Application** certificate from the paid Apple Developer Program,
+not another locally generated certificate. Private signing and notarization keys
+belong in a protected GitHub Actions environment, never in this repository.
+The local `Devbox Local Development` identity remains the default for local builds.
+
+### App icon
+
+The supplied logo is stored at `Resources/DevBox.png`, optimized with libvips to
+1024 × 1024, full-color RGBA, with unnecessary metadata removed. To replace it:
+
+```sh
+brew install vips
+sh scripts/optimize-icon.sh /path/to/original-logo.png Resources/DevBox.png
+```
+
+Use a square original at least 1024 × 1024 pixels. The optimizer downsizes to 1024,
+converts to sRGB, and uses lossless PNG compression without palette quantization.
+The normal build runs `scripts/build-icon.sh` to generate all macOS icon sizes
+and a `DevBox.icns` inside the app bundle. It preserves the artwork and transparency,
+without cropping or stretching. Normal builds/CI use Apple's bundled tools and
+do not require libvips to be installed.
+
 ### MariaDB client library
 
 DevBox loads MariaDB Connector/C at runtime. It supports the standard Apple Silicon
@@ -154,12 +185,36 @@ automatically prune them or unlock worktrees.
 - Enter your MariaDB username/password, optionally test the connection, then save.
   Empty passwords are supported for accounts that permit them.
 - Passwords are stored in **macOS Keychain**. Connection settings contain no passwords.
-- The table lists databases visible to that account.
+- The table lists databases visible to that account, then loads metadata in the
+  background: **estimated size**, its **data/index breakdown**, **table and view
+  counts**, and **estimated rows**. The inventory remains usable while statistics load.
+- The header shows the estimated total; selecting databases shows a selected total
+  in the footer and deletion confirmation. Hover over a size for its timestamp,
+  breakdown, and any error. Missing values display `—`, not zero. Failed updates
+  preserve the last successful estimate with an explicit warning and partial total.
+- Database lists and statistics are cached **only for the app session**. Switching
+  connections reuses completed results without another Keychain lookup. **Refresh**
+  (`⌘R`) reloads both; reopening the app or editing a connection invalidates the
+  relevant snapshot. Interrupted metadata loads resume on return.
+  Confirmed deletions remove only their cached rows and recompute totals from the
+  retained measurements. No post-deletion refresh is started, for databases or
+  worktrees; other sizes, Git statuses, and shared Git storage stay cached until
+  manual refresh. Failed or uncertain deletions remain listed.
+- Statistics use one batched `INFORMATION_SCHEMA` read, not a full-table `COUNT(*)`,
+  `ANALYZE`, or a scan of the server's files. They describe **visible base and
+  system-versioned tables**; views count separately. Sequence storage contributes
+  bytes, but not user-table or user-row counts.
+  An empty visible schema reports zero; a restricted account may see only part of
+  a database. InnoDB rows/sizes can be approximate, MEMORY tables describe memory,
+  and shared/unattributed free space and logs are not added to these totals.
+  **Estimated size is not guaranteed space reclaimed by deletion.**
 - Select databases and choose **Delete Selected…**. Review the names/server, then
   authenticate with Touch ID or your Mac login password.
 - Deletion runs **one item at a time**. Each row shows **Queued**, **Deleting**
   (with a spinner), **Completed**, or **Failed**, and errors stay beside that item.
-  The same indicators are used for worktree deletion and in the final results.
+  Attempted deletions show elapsed time, including time waiting for the server;
+  the batch shows completed/failed counts, not a speculative per-database percentage.
+  The same indicators and timing are used for worktree deletion and in the final results.
 
 `mysql`, `information_schema`, `performance_schema`, and `sys` are protected.
 Authentication authorizes only the reviewed batch; it does not provide MariaDB
@@ -203,6 +258,11 @@ Non-secret settings:
 Keychain generic-password service: `app.devbox.mariadb`, keyed by connection UUID.
 The app uses Apple's Security and LocalAuthentication frameworks; it never receives
 your Mac login password.
+
+`.gitignore` also excludes local environment files, exported keys/signing identities,
+database dumps, local database files, and logs. Sanitized `.env.example` files can
+be tracked. Ignore rules are a safeguard against accidental additions, not a secret
+scanner and not a way to remove secrets already committed.
 
 ## Tests
 

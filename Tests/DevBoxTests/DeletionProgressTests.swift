@@ -5,7 +5,7 @@ import Testing
 
 @MainActor
 private final class DeletionSettings: SettingsPersisting {
-    // Keep connections empty so the post-deletion refresh cannot contact a server.
+    // In-memory requests never identify a real database or require a saved connection.
     func load() throws -> AppSettings { AppSettings() }
     func save(_ settings: AppSettings) throws {}
 }
@@ -91,6 +91,7 @@ private func expectPreservedResults(_ store: AppStore) {
     let ids = store.deletionEntries.map(\.id)
     let names = store.deletionEntries.map(\.name)
     let states = store.deletionEntries.map(\.state)
+    let elapsed = store.deletionEntries.map(\.elapsed)
     #expect(store.activeSheet == nil)
     #expect(store.isModalPresented)
     #expect(!store.isDeleting)
@@ -102,6 +103,7 @@ private func expectPreservedResults(_ store: AppStore) {
     #expect(result.entries.map(\.id) == ids)
     #expect(result.entries.map(\.name) == names)
     #expect(result.entries.map(\.state) == states)
+    #expect(result.entries.map(\.elapsed) == elapsed)
     #expect(store.deletionEntries.map(\.state) == states)
 }
 
@@ -117,6 +119,7 @@ func deletionPublishesQueuedAndSequentialProgressWithoutDuplicateSubmissions() a
     #expect(store.isDeleting)
     #expect(store.deletionEntries.map(\.name) == ["first", "second", "third"])
     #expect(store.deletionEntries.map(\.state) == [.queued, .queued, .queued])
+    #expect(store.deletionEntries.allSatisfy { $0.startedAt == nil && $0.elapsed == nil })
     let ids = store.deletionEntries.map(\.id)
     #expect(await probe.names.isEmpty)
     await store.delete(request)
@@ -125,6 +128,9 @@ func deletionPublishesQueuedAndSequentialProgressWithoutDuplicateSubmissions() a
     await authentication.finish("authentication")
     await probe.waitForCalls(1)
     #expect(store.deletionEntries.map(\.state) == [.deleting, .queued, .queued])
+    #expect(store.deletionEntries[0].startedAt != nil)
+    #expect(store.deletionEntries[0].elapsed == nil)
+    #expect(store.deletionEntries[1].startedAt == nil)
     await store.delete(request)
     #expect(await probe.names == ["first"])
 
@@ -140,6 +146,7 @@ func deletionPublishesQueuedAndSequentialProgressWithoutDuplicateSubmissions() a
     await task.value
 
     #expect(store.deletionEntries.map(\.state) == [.completed, .completed, .completed])
+    #expect(store.deletionEntries.allSatisfy { $0.startedAt != nil && ($0.elapsed ?? -1) >= 0 })
     #expect(store.deletionEntries.map(\.id) == ids)
     #expect(await probe.peakConcurrency == 1)
     #expect(await probe.passwords == Array(repeating: "fake deletion-test password", count: 3))
@@ -165,6 +172,7 @@ func knownDeletionFailureContinuesSequentiallyAndPreservesFailure() async {
     await probe.finish("third")
     await task.value
     #expect(store.deletionEntries.map(\.state) == [failure, .completed, .completed])
+    #expect((store.deletionEntries[0].elapsed ?? -1) >= 0)
     #expect(await probe.peakConcurrency == 1)
     expectPreservedResults(store)
 }
@@ -181,6 +189,9 @@ func uncertainDeletionStopsRemainingItemsWithoutRetry() async {
     await task.value
 
     #expect(store.deletionEntries[0].state == .completed)
+    #expect((store.deletionEntries[1].elapsed ?? -1) >= 0)
+    #expect(store.deletionEntries[2].startedAt == nil)
+    #expect(store.deletionEntries[2].elapsed == nil)
     if case .uncertain(let detail) = store.deletionEntries[1].state {
         #expect(!detail.isEmpty)
     } else {

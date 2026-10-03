@@ -19,21 +19,31 @@ struct DeletionConfirmation: View {
                 }
             }
             Text(warning).fixedSize(horizontal: false, vertical: true)
+            if let estimate = request.statisticsSummary {
+                Text("\(estimate) · Not guaranteed reclaimed space")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     switch request.items {
                     case .worktrees(_, let rows):
                         ForEach(rows) { row in
+                            let entry = store.deletionEntry(for: row.worktree.path, in: request)
                             DeletionItemView(
                                 name: row.worktree.branch ?? "Detached HEAD",
                                 subtitle: "\(row.worktree.path)\n\(row.statusDescription)",
-                                state: store.deletionState(for: row.worktree.path, in: request)
+                                state: entry.state, startedAt: entry.startedAt, elapsed: entry.elapsed
                             )
                             if row.id != rows.last?.id { Divider() }
                         }
                     case .databases(_, let databases):
                         ForEach(databases) { database in
-                            DeletionItemView(name: database.name, state: store.deletionState(for: database.name, in: request))
+                            let entry = store.deletionEntry(for: database.name, in: request)
+                            DeletionItemView(
+                                name: database.name, state: entry.state,
+                                startedAt: entry.startedAt, elapsed: entry.elapsed
+                            )
                             if database.id != databases.last?.id { Divider() }
                         }
                     }
@@ -136,7 +146,10 @@ struct OperationResultsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     ForEach(result.entries) { entry in
-                        DeletionItemView(name: entry.name, state: entry.state)
+                        DeletionItemView(
+                            name: entry.name, state: entry.state,
+                            startedAt: entry.startedAt, elapsed: entry.elapsed
+                        )
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -157,6 +170,8 @@ struct DeletionItemView: View {
     let name: String
     var subtitle: String?
     let state: DeletionState
+    var startedAt: Date?
+    var elapsed: TimeInterval?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -168,7 +183,17 @@ struct DeletionItemView: View {
                     }
                 }
                 Spacer(minLength: 0)
-                DeletionStateBadge(state: state)
+                VStack(alignment: .trailing, spacing: 4) {
+                    DeletionStateBadge(state: state)
+                    if let elapsed {
+                        ElapsedTimeLabel(seconds: elapsed)
+                    } else if state == .deleting, let startedAt {
+                        // Only this tiny view ticks, not the app store or database table.
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            ElapsedTimeLabel(seconds: max(0, context.date.timeIntervalSince(startedAt)))
+                        }
+                    }
+                }
             }
             if let message = state.detail {
                 Text(message)
@@ -179,6 +204,18 @@ struct DeletionItemView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ElapsedTimeLabel: View {
+    let seconds: TimeInterval
+
+    var body: some View {
+        Text("\(seconds, format: .number.precision(.fractionLength(1))) s")
+            .font(.caption)
+            .monospacedDigit()
+            .foregroundStyle(.secondary)
+            .help("Elapsed time for this deletion attempt, including waiting for the server.")
     }
 }
 
