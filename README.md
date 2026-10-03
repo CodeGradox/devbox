@@ -3,6 +3,17 @@
 A native macOS utility for Git worktrees and local MariaDB databases, built with
 Swift and SwiftUI. Requires macOS 26 or newer.
 
+## Download
+
+Get the app from the [latest release](https://github.com/CodeGradox/devbox/releases/latest):
+
+- [Apple Silicon (M1 and newer)](https://github.com/CodeGradox/devbox/releases/latest/download/DevBox-macos26-arm64-adhoc-non-notarized-app.zip)
+- [Intel](https://github.com/CodeGradox/devbox/releases/latest/download/DevBox-macos26-x86_64-adhoc-non-notarized-app.zip)
+
+Unzip and move `DevBox.app` into Applications. These builds are **ad-hoc signed,
+not notarized**; macOS may require approval in **System Settings → Privacy & Security**.
+Private repositories require GitHub access to download releases.
+
 ## Build and run
 
 Install Xcode 26 or newer (or Swift 6.2 or newer with the macOS 26 SDK), then from this repository:
@@ -55,6 +66,10 @@ The [macOS build workflow](.github/workflows/build.yml) tests and packages nativ
 Apple Silicon and Intel apps on macOS 26. Download the architecture-specific ZIP
 from a successful run's **Artifacts** section. These CI builds are explicitly
 ad-hoc signed, not notarized, and need no signing secrets.
+Pushing a version tag such as `v0.1.0` also publishes the two app ZIPs and checksums
+to **GitHub Releases**, after both architectures pass. Release assets do not have
+the Actions artifacts' 14-day expiry. The tag must match the app version in
+`Resources/Info.plist`; see [release instructions](docs/github-releases.md#version-tags-publish-downloads).
 
 For trusted public downloads, use the optional signed-release workflow and follow
 [the GitHub signing setup](docs/github-releases.md). You need an **Apple-issued

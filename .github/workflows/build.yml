@@ -4,7 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
-    tags: ['*']
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -48,6 +48,11 @@ jobs:
           sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True).strip()
           assert int(sdk.split(".")[0]) >= 26, sdk
           PY
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+            version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
       - name: Test without database integration
         run: |
           unset DEVBOX_TEST_MARIADB_SOCKET
@@ -89,3 +94,62 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+  publish:
+    name: Publish versioned app downloads
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: publish-${{ github.ref }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download verified builds from this run
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          mkdir -p downloads
+          for arch in arm64 x86_64; do
+            gh run download "$GITHUB_RUN_ID" \
+              --name "DevBox-macos26-$arch-adhoc-non-notarized" \
+              --dir "$RUNNER_TEMP/build-$arch"
+            (cd "$RUNNER_TEMP/build-$arch" && sha256sum --check SHA256SUMS.txt)
+            cp "$RUNNER_TEMP/build-$arch/DevBox-macos26-$arch-adhoc-non-notarized-app.zip" downloads/
+          done
+          (cd downloads && sha256sum ./*.zip > SHA256SUMS.txt)
+      - name: Publish complete release
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          ## Downloads
+
+          Requires **macOS 26 or newer**.
+
+          - [Apple Silicon (M1 and newer)](https://github.com/$GH_REPO/releases/download/$TAG/DevBox-macos26-arm64-adhoc-non-notarized-app.zip)
+          - [Intel](https://github.com/$GH_REPO/releases/download/$TAG/DevBox-macos26-x86_64-adhoc-non-notarized-app.zip)
+
+          Extract the ZIP and move **DevBox.app** into Applications.
+
+          These personal-use builds are **ad-hoc signed, not Apple-notarized**.
+          macOS may require approval in **System Settings → Privacy & Security → Open Anyway**.
+          Updates may prompt for Keychain access again. Do not disable Gatekeeper globally.
+
+          MariaDB features require a local server and a matching Homebrew MariaDB client library.
+          EOF
+          if gh release view "$TAG" --json isDraft,targetCommitish > existing.json 2>/dev/null; then
+            # Retry our own incomplete draft, never overwrite a published release.
+            jq -e --arg sha "$GITHUB_SHA" '.isDraft and .targetCommitish == $sha' existing.json >/dev/null
+          else
+            gh release create "$TAG" --verify-tag --target "$GITHUB_SHA" \
+              --draft --title "DevBox $TAG" --notes-file notes.md
+          fi
+          gh release upload "$TAG" downloads/*.zip downloads/SHA256SUMS.txt --clobber
+          gh release edit "$TAG" --notes-file notes.md --draft=false --latest

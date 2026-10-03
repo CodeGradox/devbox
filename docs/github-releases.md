@@ -10,7 +10,7 @@ These are separate native downloads, not universal binaries.
 
 ## Ordinary CI: no credentials
 
-`build.yml` runs for pull requests, pushes to `main`, all tags, and manual
+`build.yml` runs for pull requests, pushes to `main`, `v*` tags, and manual
 dispatch. Each architecture runs `swift test`, builds an optimized release app,
 checks its architecture, deployment target, and ad hoc signature, and uploads
 app and standalone-executable ZIPs plus SHA-256 checksums. Download them from
@@ -27,8 +27,10 @@ disabled by unsetting `DEVBOX_TEST_MARIADB_SOCKET`; the existing
 `scripts/test-mariadb.sh` is a separate opt-in isolated integration script,
 not part of these jobs.
 
-Both workflows grant only `contents: read`, pin official checkout and upload
+Build jobs grant only `contents: read`, pin official checkout and upload
 actions to full commit SHAs, and disable checkout credential persistence.
+Only the tag-triggered publishing job gets `contents: write` and `actions: read`,
+using GitHub's automatic short-lived token rather than a personal access token.
 The pins were checked against GitHub's public tag API:
 
 - [checkout v7.0.1](https://api.github.com/repos/actions/checkout/git/ref/tags/v7.0.1):
@@ -36,8 +38,33 @@ The pins were checked against GitHub's public tag API:
 - [upload-artifact v7.0.1](https://api.github.com/repos/actions/upload-artifact/git/ref/tags/v7.0.1):
   `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a`
 
-There is no `pull_request_target`, no CI signing secret, and no automatic release
-publication. Review action updates and verify replacement SHAs before changing pins.
+There is no `pull_request_target` or CI signing secret. Pull requests and ordinary
+branch pushes cannot publish releases. Review action updates and verify replacement
+SHAs before changing pins.
+
+## Version tags publish downloads
+
+After both native builds and tests succeed, a push of a stable version tag
+(`vMAJOR.MINOR.PATCH`) publishes the two app ZIPs and a combined `SHA256SUMS.txt`
+to a GitHub Release. The job downloads only artifacts from that same workflow run
+and checks their hashes before uploading. It publishes from a draft only after
+all assets have uploaded successfully; failed uploads leave an unpublished draft.
+A retry may finish a draft for the same commit but never overwrite a published release.
+
+Before tagging, update `CFBundleShortVersionString` in `Resources/Info.plist`
+and commit/push it. The workflow verifies that the tag matches the app's version:
+
+```sh
+git tag -a v0.1.0 -m "DevBox v0.1.0"
+git push origin refs/tags/v0.1.0
+```
+
+For later releases use a new version; do not move an existing release tag.
+Download from [the latest release](https://github.com/CodeGradox/devbox/releases/latest)
+or the README's architecture-specific links. Release assets have no Actions
+retention expiry or extra artifact-wrapper ZIP. Private repositories still require
+GitHub authentication/access; this workflow never changes repository visibility.
+These downloads remain **ad-hoc signed and non-notarized**.
 
 ## Optional Apple-trusted manual build
 
