@@ -1,0 +1,91 @@
+import Foundation
+import Synchronization
+import os
+
+/// Bounded synchronous I/O outside Swift's cooperative task pool. Awaiting callers
+/// suspend on a checked continuation; only OperationQueue workers block on disk or
+/// process I/O. Operations aren't canceled through OperationQueue, so every queued
+/// continuation is resumed exactly once, including canceled jobs.
+final class BlockingIOExecutor: Sendable {
+    static let shared = BlockingIOExecutor(maxConcurrentOperations: 4)
+    private static let cancellationKey = "app.devbox.blocking-io.cancellation"
+    private let queue: OperationQueue
+    private let signposter = OSSignposter(subsystem: "app.devbox.DevBox", category: "Blocking I/O")
+
+    final class Cancellation: Sendable {
+        private let cancelled = Mutex(false)
+
+        func cancel() { cancelled.withLock { $0 = true } }
+        func check() throws {
+            if cancelled.withLock({ $0 }) { throw CancellationError() }
+        }
+    }
+
+    init(maxConcurrentOperations: Int) {
+        precondition(maxConcurrentOperations > 0)
+        queue = OperationQueue()
+        queue.name = "DevBox blocking I/O"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = maxConcurrentOperations
+    }
+
+    /// Includes queued jobs and active workers, useful for diagnostics.
+    var outstandingOperationCount: Int { queue.operationCount }
+
+    func run<T: Sendable>(
+        _ operation: @escaping @Sendable (Cancellation) throws -> T
+    ) async throws -> T {
+        let cancellation = Cancellation()
+        return try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            return try await withCheckedThrowingContinuation { continuation in
+                queue.addOperation { [signposter] in
+                    let interval = signposter.beginInterval("Blocking operation")
+                    defer { signposter.endInterval("Blocking operation", interval) }
+                    let result = Result {
+                        try cancellation.check()
+                        return try Self.withCancellationContext(cancellation) {
+                            try operation(cancellation)
+                        }
+                    }
+                    // A completed destructive operation remains a success even if
+                    // cancellation arrives afterward. Callers suppress stale UI results.
+                    continuation.resume(with: result)
+                }
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
+
+    /// This context is strictly synchronous and never spans an await. It allows
+    /// shared Git helpers to honor cancellation without plumbing a token through
+    /// every command/parser. Restore nested contexts before reusing a worker.
+    private static func withCancellationContext<T>(
+        _ cancellation: Cancellation, operation: () throws -> T
+    ) rethrows -> T {
+        let dictionary = Thread.current.threadDictionary
+        let previous = dictionary[cancellationKey]
+        dictionary[cancellationKey] = cancellation
+        defer {
+            if let previous { dictionary[cancellationKey] = previous }
+            else { dictionary.removeObject(forKey: cancellationKey) }
+        }
+        return try operation()
+    }
+
+    static func checkCancellation() throws {
+        try Task.checkCancellation()
+        try (Thread.current.threadDictionary[cancellationKey] as? Cancellation)?.check()
+    }
+
+    /// Capture the worker's token once for a hot traversal loop, rather than
+    /// accessing Foundation's thread dictionary for every filesystem entry.
+    static func cancellationCheck() -> @Sendable () throws -> Void {
+        let cancellation = Thread.current.threadDictionary[cancellationKey] as? Cancellation
+        return {
+            try Task.checkCancellation()
+            try cancellation?.check()
+        }
+    }
+}

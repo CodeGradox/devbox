@@ -1,0 +1,240 @@
+import SwiftUI
+
+struct DeletionConfirmation: View {
+    @Environment(AppStore.self) private var store
+    @Environment(\.dismiss) private var dismiss
+    @State private var acknowledged = false
+    let request: DeletionRequest
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 14) {
+                Image(systemName: "trash.circle.fill")
+                    .font(.system(size: 42))
+                    .foregroundStyle(.red)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.title2.weight(.semibold))
+                    Text(scope).foregroundStyle(.secondary)
+                }
+            }
+            Text(warning).fixedSize(horizontal: false, vertical: true)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    switch request.items {
+                    case .worktrees(_, let rows):
+                        ForEach(rows) { row in
+                            DeletionItemView(
+                                name: row.worktree.branch ?? "Detached HEAD",
+                                subtitle: "\(row.worktree.path)\n\(row.statusDescription)",
+                                state: store.deletionState(for: row.worktree.path, in: request)
+                            )
+                            if row.id != rows.last?.id { Divider() }
+                        }
+                    case .databases(_, let databases):
+                        ForEach(databases) { database in
+                            DeletionItemView(name: database.name, state: store.deletionState(for: database.name, in: request))
+                            if database.id != databases.last?.id { Divider() }
+                        }
+                    }
+                }
+                .padding(12)
+            }
+            .frame(minHeight: 70, maxHeight: 210)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+            if store.isDeleting {
+                ProgressView(value: Double(finishedCount), total: Double(max(request.count, 1)))
+                    .accessibilityLabel("Deletion batch progress")
+                DeletionSummary(entries: store.deletionEntries)
+            }
+            if case .worktrees = request.items {
+                Toggle("Delete all contents, including uncommitted changes and ignored files", isOn: $acknowledged)
+                    .toggleStyle(.checkbox)
+                    .disabled(store.isDeleting)
+            }
+            Label(
+                store.isDeleting
+                    ? "Items are processed one at a time. Uncertain results stop the batch."
+                    : "macOS will ask for Touch ID or your Mac login password.",
+                systemImage: store.isDeleting ? "list.number" : "touchid"
+            )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if let error = store.deletionError {
+                Text(error).foregroundStyle(.red).font(.callout)
+            }
+            HStack {
+                if store.isDeleting {
+                    ProgressView().controlSize(.small)
+                    Text(store.progressText.isEmpty ? "Authenticating…" : store.progressText)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                Button("Cancel", role: .cancel) { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(store.isDeleting)
+                Button("Authenticate & Delete…", role: .destructive) {
+                    Task { await store.delete(request) }
+                }
+                .disabled(store.isDeleting || needsAcknowledgment)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .interactiveDismissDisabled(store.isDeleting)
+    }
+
+    private var finishedCount: Int {
+        store.deletionEntries.filter {
+            switch $0.state {
+            case .queued, .deleting: false
+            default: true
+            }
+        }.count
+    }
+
+    private var needsAcknowledgment: Bool {
+        if case .worktrees = request.items { return !acknowledged }
+        return false
+    }
+
+    private var title: String {
+        switch request.items {
+        case .worktrees: "Delete \(request.count) Worktree\(request.count == 1 ? "" : "s")?"
+        case .databases: "Delete \(request.count) Database\(request.count == 1 ? "" : "s")?"
+        }
+    }
+
+    private var scope: String {
+        switch request.items {
+        case .worktrees(let project, _): project.name
+        case .databases(let connection, _):
+            "\(connection.name) · \(connection.settings.socketPath.isEmpty ? "\(connection.settings.host):\(connection.settings.port)" : connection.settings.socketPath)"
+        }
+    }
+
+    private var warning: String {
+        switch request.items {
+        case .worktrees:
+            "The selected folders and their Git worktree registrations will be permanently removed. Branches will be kept. This cannot be undone."
+        case .databases:
+            "All tables and data in the selected databases will be permanently deleted. No backup will be made. This cannot be undone."
+        }
+    }
+}
+
+struct OperationResultsView: View {
+    @Environment(\.dismiss) private var dismiss
+    let result: OperationResult
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(result.title).font(.title2.weight(.semibold))
+            DeletionSummary(entries: result.entries)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(result.entries) { entry in
+                        DeletionItemView(name: entry.name, state: entry.state)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 300)
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 540)
+    }
+}
+
+/// No implicit app state: safe to host in a sheet, table, or rendering test.
+struct DeletionItemView: View {
+    let name: String
+    var subtitle: String?
+    let state: DeletionState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(name).fontWeight(.medium).textSelection(.enabled)
+                    if let subtitle {
+                        Text(subtitle).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                    }
+                }
+                Spacer(minLength: 0)
+                DeletionStateBadge(state: state)
+            }
+            if let message = state.detail {
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct DeletionStateBadge: View {
+    let state: DeletionState
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if state == .deleting {
+                ProgressView().controlSize(.mini).frame(width: 14, height: 14)
+            } else {
+                Image(systemName: symbol).accessibilityHidden(true)
+            }
+            Text(state.title)
+        }
+        .font(.caption.weight(.medium))
+        .foregroundStyle(tint)
+        .fixedSize()
+        .accessibilityElement(children: .combine)
+    }
+
+    private var symbol: String {
+        switch state {
+        case .queued: "clock"
+        case .deleting: "arrow.triangle.2.circlepath"
+        case .completed: "checkmark.circle.fill"
+        case .failed: "xmark.circle.fill"
+        case .uncertain: "exclamationmark.triangle.fill"
+        case .notAttempted: "pause.circle"
+        }
+    }
+
+    private var tint: Color {
+        switch state {
+        case .queued, .notAttempted: .secondary
+        case .deleting: .blue
+        case .completed: .green
+        case .failed: .red
+        case .uncertain: .orange
+        }
+    }
+}
+
+private struct DeletionSummary: View {
+    let entries: [OperationResult.Entry]
+
+    var body: some View {
+        Text(summary).font(.callout).foregroundStyle(.secondary)
+    }
+
+    private var summary: String {
+        let counts = Dictionary(grouping: entries, by: { $0.state.title }).mapValues(\.count)
+        return ["Completed", "Failed", "Uncertain", "Not attempted", "Deleting", "Queued"]
+            .compactMap { label in
+                counts[label].map { "\($0) \(label.lowercased())" }
+            }
+            .joined(separator: " · ")
+    }
+}
