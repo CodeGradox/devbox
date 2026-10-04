@@ -55,6 +55,11 @@ private struct DevBoxCommands: Commands {
             }
         }
         CommandMenu("Actions") {
+            Button("Open in Zed") { [ids = store.worktreeSelection] in
+                Task { await store.openInZed(ids) }
+            }
+            .keyboardShortcut("o", modifiers: [.command, .shift])
+            .disabled(!store.canOpenInZed(store.worktreeSelection))
             Button("Refresh") { store.refresh() }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(store.destination == nil || store.isDeleting || store.isModalPresented)

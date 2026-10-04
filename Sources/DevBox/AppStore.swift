@@ -180,6 +180,7 @@ final class AppStore {
     private let removeWorktree: @Sendable (WorktreeRecord, ProjectRecord) async throws -> Void
     private let listDatabases: @Sendable (ConnectionSettings, String) async throws -> [DatabaseRecord]
     private let loadStatistics: @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics]
+    private let openWorktreeInZed: @MainActor (String) async throws -> Void
     private let sizeQueue: WorktreeSizeQueue
     private let inspectBranches: @Sendable (ProjectRecord, [WorktreeRecord]) async throws -> BranchInspection
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
@@ -234,6 +235,9 @@ final class AppStore {
         loadStatistics: @escaping @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics] = {
             try await DatabaseService().databaseStatistics(settings: $0, password: $1)
         },
+        openWorktreeInZed: @escaping @MainActor (String) async throws -> Void = {
+            try await ZedLauncher().open(worktreePath: $0)
+        },
         authenticate: @escaping @MainActor (String) async throws -> Void = { reason in
             try await OwnerAuthentication.authorize(reason: reason)
         }
@@ -246,6 +250,7 @@ final class AppStore {
         self.removeWorktree = removeWorktree
         self.listDatabases = listDatabases
         self.loadStatistics = loadStatistics
+        self.openWorktreeInZed = openWorktreeInZed
         self.authenticate = authenticate
         do {
             settings = try persistence.load()
@@ -281,6 +286,26 @@ final class AppStore {
         return worktreeSelection.sorted().compactMap { session.row(id: $0)?.row }
     }
     var selectedDatabases: [DatabaseRecord] { databases.filter { databaseSelection.contains($0.id) } }
+
+    func canOpenInZed(_ ids: Set<String>) -> Bool {
+        worktreeToOpenInZed(ids) != nil
+    }
+
+    func openInZed(_ ids: Set<String>) async {
+        guard let worktree = worktreeToOpenInZed(ids) else { return }
+        do {
+            try await openWorktreeInZed(worktree.path)
+        } catch {
+            errorMessage = "Could not open \(worktree.path) in Zed.\n\(error.localizedDescription)"
+        }
+    }
+
+    private func worktreeToOpenInZed(_ ids: Set<String>) -> WorktreeRecord? {
+        guard !isDeleting, !isModalPresented, ids.count == 1,
+              let id = ids.first, let worktree = selectedProjectSession?.row(id: id)?.row.worktree,
+              worktree.exists, !worktree.isBare else { return nil }
+        return worktree
+    }
 
     var isMeasuringSizes: Bool {
         selectedProjectSession?.isMeasuringSizes ?? false

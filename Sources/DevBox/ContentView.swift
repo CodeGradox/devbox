@@ -57,6 +57,15 @@ private struct WorkspaceToolbar: ToolbarContent {
     var body: some ToolbarContent {
         if store.destination != nil {
             ToolbarItemGroup {
+                if store.selectedProject != nil {
+                    Button { [ids = store.worktreeSelection] in
+                        Task { await store.openInZed(ids) }
+                    } label: {
+                        Label("Open in Zed", systemImage: "chevron.left.forwardslash.chevron.right")
+                    }
+                    .help("Open the selected worktree in Zed (⇧⌘O)")
+                    .disabled(!store.canOpenInZed(store.worktreeSelection))
+                }
                 Button {
                     store.refresh()
                 } label: {
@@ -258,6 +267,8 @@ private struct WorktreeTable: View {
             }
             .contextMenu(forSelectionType: String.self) { ids in
                 WorktreeContextMenu(session: session, store: store, ids: ids)
+            } primaryAction: { ids in
+                Task { await store.openInZed(ids) }
             }
             .overlay {
                 if session.rows.isEmpty && store.isRefreshing { ProgressView("Loading worktrees…") }

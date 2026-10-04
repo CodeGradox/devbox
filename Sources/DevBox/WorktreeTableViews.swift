@@ -108,6 +108,11 @@ struct WorktreeContextMenu: View {
 
     var body: some View {
         if let row = session.rows.first(where: { ids.contains($0.id) })?.row, ids.count == 1 {
+            Button("Open in Zed") { [store, ids] in
+                Task { await store.openInZed(ids) }
+            }
+            .disabled(!store.canOpenInZed(ids))
+            Divider()
             Button("Refresh Disk Usage") { [store, id = row.id] in
                 store.refreshWorktreeSize(id)
             }
