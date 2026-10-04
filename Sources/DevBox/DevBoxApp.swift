@@ -20,6 +20,9 @@ struct DevBoxApp: App {
                     delegate.store = store
                     store.loadSelection()
                 }
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                    store.refreshEditorApplications()
+                }
         }
         .defaultSize(width: 1140, height: 720)
         .commands {
@@ -55,11 +58,13 @@ private struct DevBoxCommands: Commands {
             }
         }
         CommandMenu("Actions") {
-            Button("Open in Zed") { [ids = store.worktreeSelection] in
-                Task { await store.openInZed(ids) }
+            Button(store.openInEditorTitle) { [ids = store.worktreeSelection] in
+                Task { await store.openInEditor(ids) }
             }
             .keyboardShortcut("o", modifiers: [.command, .shift])
-            .disabled(!store.canOpenInZed(store.worktreeSelection))
+            .disabled(!store.canOpenInEditor(store.worktreeSelection))
+            OpenWithMenu(store: store, ids: store.worktreeSelection)
+            Divider()
             Button("Refresh") { store.refresh() }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(store.destination == nil || store.isDeleting || store.isModalPresented)

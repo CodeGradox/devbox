@@ -217,17 +217,29 @@ private func waitForGitStatus(_ store: AppStore) async {
     }
 }
 
+@MainActor
+private var testEditorApplication: EditorApplication {
+    EditorApplication(
+        url: URL(fileURLWithPath: "/test/Editor.app"), name: "Test Editor",
+        bundleIdentifier: "test.editor"
+    )
+}
+
 @Test(.timeLimit(.minutes(1))) @MainActor
-func openInZedUsesRequestedWorktreeWithoutChangingSelectionOrBranches() async throws {
+func openInEditorUsesRequestedWorktreeWithoutChangingSelectionOrBranches() async throws {
     let fixture = try StoreGitFixture()
     defer { fixture.cleanup() }
     let project = try await GitService().discoverProject(at: fixture.repository.path)
     let persistence = MemorySettings()
     persistence.value.projects = [project]
+    persistence.value.preferredEditor = testEditorApplication
     var openedPaths: [String] = []
     let store = AppStore(
         persistence: persistence, credentials: MemoryCredentials(),
-        openWorktreeInZed: { openedPaths.append($0) }
+        openWorktreeInEditor: { path, editor in
+            #expect(editor == testEditorApplication)
+            openedPaths.append(path)
+        }
     )
     store.refresh()
     await waitForGitStatus(store)
@@ -238,12 +250,12 @@ func openInZedUsesRequestedWorktreeWithoutChangingSelectionOrBranches() async th
     store.worktreeSelection = [main.id]
 
     // Right-clicking a different row must open that row, not the current selection.
-    #expect(store.canOpenInZed([linked.id]))
-    await store.openInZed([linked.id])
+    #expect(store.canOpenInEditor([linked.id]))
+    await store.openInEditor([linked.id])
     #expect(store.worktreeSelection == [main.id])
     // Protection against deletion must not prevent opening the main checkout.
-    #expect(store.canOpenInZed(store.worktreeSelection))
-    await store.openInZed(store.worktreeSelection)
+    #expect(store.canOpenInEditor(store.worktreeSelection))
+    await store.openInEditor(store.worktreeSelection)
 
     #expect(openedPaths == [linked.worktree.path, main.worktree.path])
     #expect(store.errorMessage == nil)
@@ -252,15 +264,16 @@ func openInZedUsesRequestedWorktreeWithoutChangingSelectionOrBranches() async th
 }
 
 @Test(.timeLimit(.minutes(1))) @MainActor
-func openInZedRejectsInvalidSelectionsAndAllowsLockedOrDetachedWorktrees() async throws {
+func openInEditorRejectsInvalidSelectionsAndAllowsLockedOrDetachedWorktrees() async throws {
     let fixture = try StoreGitFixture()
     defer { fixture.cleanup() }
     let persistence = MemorySettings()
     persistence.value.projects = [try await GitService().discoverProject(at: fixture.repository.path)]
+    persistence.value.preferredEditor = testEditorApplication
     var openedPaths: [String] = []
     let store = AppStore(
         persistence: persistence, credentials: MemoryCredentials(),
-        openWorktreeInZed: { openedPaths.append($0) }
+        openWorktreeInEditor: { path, _ in openedPaths.append(path) }
     )
     store.refresh()
     await waitForGitStatus(store)
@@ -278,39 +291,40 @@ func openInZedRejectsInvalidSelectionsAndAllowsLockedOrDetachedWorktrees() async
         ["/test/locked", "/test/detached"], ["/test/locked", "/test/unknown"]
     ]
     for ids in invalidSelections {
-        #expect(!store.canOpenInZed(ids))
-        await store.openInZed(ids)
+        #expect(!store.canOpenInEditor(ids))
+        await store.openInEditor(ids)
     }
     #expect(openedPaths.isEmpty)
 
     for record in records.prefix(2) {
-        #expect(store.canOpenInZed([record.id]))
-        await store.openInZed([record.id])
+        #expect(store.canOpenInEditor([record.id]))
+        await store.openInEditor([record.id])
     }
     #expect(openedPaths == ["/test/locked", "/test/detached"])
 
     store.connectionEditor = .init()
-    #expect(!store.canOpenInZed(["/test/locked"]))
-    await store.openInZed(["/test/locked"])
+    #expect(!store.canOpenInEditor(["/test/locked"]))
+    await store.openInEditor(["/test/locked"])
     store.connectionEditor = nil
     session.removeConfirmedWorktrees(ids: ["/test/locked"])
-    #expect(!store.canOpenInZed(["/test/locked"]))
-    await store.openInZed(["/test/locked"])
+    #expect(!store.canOpenInEditor(["/test/locked"]))
+    await store.openInEditor(["/test/locked"])
     store.destination = nil
-    #expect(!store.canOpenInZed(["/test/detached"]))
-    await store.openInZed(["/test/detached"])
+    #expect(!store.canOpenInEditor(["/test/detached"]))
+    await store.openInEditor(["/test/detached"])
     #expect(openedPaths.count == 2)
 }
 
 @Test(.timeLimit(.minutes(1))) @MainActor
-func openInZedShowsLaunchFailureWithWorktreePath() async throws {
+func openInEditorShowsLaunchFailureWithWorktreePath() async throws {
     let fixture = try StoreGitFixture()
     defer { fixture.cleanup() }
     let persistence = MemorySettings()
     persistence.value.projects = [try await GitService().discoverProject(at: fixture.repository.path)]
+    persistence.value.preferredEditor = testEditorApplication
     let store = AppStore(
         persistence: persistence, credentials: MemoryCredentials(),
-        openWorktreeInZed: { _ in
+        openWorktreeInEditor: { _, _ in
             throw NSError(domain: "EditorTest", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "The editor could not be launched."
             ])
@@ -321,10 +335,10 @@ func openInZedShowsLaunchFailureWithWorktreePath() async throws {
     await waitForSizes(store)
     let linked = try #require(store.worktrees.first { !$0.worktree.isMain })
 
-    await store.openInZed([linked.id])
+    await store.openInEditor([linked.id])
 
     #expect(store.errorMessage?.contains(linked.worktree.path) == true)
-    #expect(store.errorMessage?.contains("Zed") == true)
+    #expect(store.errorMessage?.contains("Test Editor") == true)
     #expect(store.errorMessage?.contains("The editor could not be launched.") == true)
 }
 

@@ -9,7 +9,7 @@ Requires **macOS 26 or newer**.
 
 - Organize multiple projects and see their worktrees in one place.
 - See Git status, merge status, and missing upstream branches.
-- Open a branch's worktree in Zed without switching branches.
+- Open a branch's worktree in your preferred editor without switching branches.
 - View worktree and project sizes without double-counting nested worktrees.
 - Refresh an individual worktree's size or refresh the whole project.
 - Delete selected worktrees together, removing their folders and registrations while keeping their branches.
@@ -61,12 +61,18 @@ the app locally without disabling Gatekeeper. A new build may need approval agai
 Choose **Add Project…** to select a Git repository or one of its worktrees.
 Choose **Add Connection…** to enter your local MariaDB connection details.
 
-To edit a branch, select its worktree and choose **Open in Zed** from the toolbar,
-right-click menu, or **Actions** menu (`⇧⌘O`). You can also double-click the row.
-Install [Zed](https://zed.dev) first; its command-line tool is not required.
-This opens the existing checkout, including the main checkout or a detached HEAD,
-without creating a worktree or changing branches. Select only one worktree;
-bare repositories and missing folders cannot be opened.
+To edit a branch, select its worktree and use **Open With** in the toolbar,
+right-click menu, or **Actions** menu. DevBox lists installed apps that advertise
+folder support; choose **Other…** to select an app that isn't listed. After a
+successful open, DevBox remembers that app as your preferred editor without
+changing macOS's default folder handler.
+
+The **Open in [editor]** action (`⇧⌘O`) and a row double-click use your preferred
+editor. Zed is the initial default if installed; otherwise DevBox asks you to
+choose an app. No editor command-line tool is required. This opens the existing
+checkout, including the main checkout or a detached HEAD, without creating a
+worktree or changing branches. Select only one worktree; bare repositories and
+missing folders cannot be opened.
 
 MariaDB features require an existing local server and its client library. If
 DevBox reports that the client library is missing, install it and restart DevBox:

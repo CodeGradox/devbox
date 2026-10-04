@@ -159,6 +159,9 @@ final class AppStore {
     private(set) var isRefreshing = false
     private(set) var isDeleting = false
     private(set) var progressText = ""
+    private(set) var editorApplications: [EditorApplication] = []
+    private(set) var preferredEditor: EditorApplication?
+    private(set) var isChoosingEditor = false
     var errorMessage: String?
     private(set) var loadError: String?
     private(set) var deletionError: String?
@@ -180,7 +183,9 @@ final class AppStore {
     private let removeWorktree: @Sendable (WorktreeRecord, ProjectRecord) async throws -> Void
     private let listDatabases: @Sendable (ConnectionSettings, String) async throws -> [DatabaseRecord]
     private let loadStatistics: @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics]
-    private let openWorktreeInZed: @MainActor (String) async throws -> Void
+    private let editorLauncher: EditorLauncher
+    private let chooseEditor: @MainActor () -> URL?
+    private let openWorktreeInEditor: @MainActor (String, EditorApplication) async throws -> Void
     private let sizeQueue: WorktreeSizeQueue
     private let inspectBranches: @Sendable (ProjectRecord, [WorktreeRecord]) async throws -> BranchInspection
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
@@ -208,7 +213,7 @@ final class AppStore {
         set { activeSheet = newValue.map(AppSheet.connection) }
     }
 
-    var isModalPresented: Bool { activeSheet != nil || queuedSheet != nil }
+    var isModalPresented: Bool { activeSheet != nil || queuedSheet != nil || isChoosingEditor }
 
     func sheetDidDismiss() {
         guard let next = queuedSheet else { return }
@@ -235,9 +240,9 @@ final class AppStore {
         loadStatistics: @escaping @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics] = {
             try await DatabaseService().databaseStatistics(settings: $0, password: $1)
         },
-        openWorktreeInZed: @escaping @MainActor (String) async throws -> Void = {
-            try await ZedLauncher().open(worktreePath: $0)
-        },
+        editorLauncher: EditorLauncher = EditorLauncher(),
+        chooseEditor: @escaping @MainActor () -> URL? = { EditorApplicationPicker.choose() },
+        openWorktreeInEditor: (@MainActor (String, EditorApplication) async throws -> Void)? = nil,
         authenticate: @escaping @MainActor (String) async throws -> Void = { reason in
             try await OwnerAuthentication.authorize(reason: reason)
         }
@@ -250,7 +255,11 @@ final class AppStore {
         self.removeWorktree = removeWorktree
         self.listDatabases = listDatabases
         self.loadStatistics = loadStatistics
-        self.openWorktreeInZed = openWorktreeInZed
+        self.editorLauncher = editorLauncher
+        self.chooseEditor = chooseEditor
+        self.openWorktreeInEditor = openWorktreeInEditor ?? { path, application in
+            try await editorLauncher.open(worktreePath: path, application: application)
+        }
         self.authenticate = authenticate
         do {
             settings = try persistence.load()
@@ -269,6 +278,7 @@ final class AppStore {
             settingsReadable = false
             errorMessage = "Could not read settings. Existing settings will not be overwritten.\n\(error.localizedDescription)"
         }
+        refreshEditorApplications()
     }
 
     var selectedProject: ProjectRecord? {
@@ -287,20 +297,71 @@ final class AppStore {
     }
     var selectedDatabases: [DatabaseRecord] { databases.filter { databaseSelection.contains($0.id) } }
 
-    func canOpenInZed(_ ids: Set<String>) -> Bool {
-        worktreeToOpenInZed(ids) != nil
+    var openInEditorTitle: String {
+        preferredEditor.map { "Open in \($0.name)" } ?? "Open in Editor…"
     }
 
-    func openInZed(_ ids: Set<String>) async {
-        guard let worktree = worktreeToOpenInZed(ids) else { return }
+    /// Discover outside view bodies, at launch and when returning to DevBox.
+    /// A manually chosen app remains available even if it does not advertise folder support.
+    func refreshEditorApplications() {
+        if let saved = settings.preferredEditor {
+            preferredEditor = editorLauncher.resolvedApplication(saved) ?? saved
+        } else {
+            preferredEditor = editorLauncher.application(withBundleIdentifier: "dev.zed.Zed")
+        }
+        var applications = editorLauncher.applicationsForFolders()
+        if let preferredEditor, let installed = editorLauncher.resolvedApplication(preferredEditor),
+           !applications.contains(where: { $0.id == installed.id }) {
+            applications.insert(installed, at: 0)
+        }
+        if editorApplications != applications { editorApplications = applications }
+    }
+
+    func canOpenInEditor(_ ids: Set<String>) -> Bool {
+        worktreeToOpenInEditor(ids) != nil
+    }
+
+    /// An explicit Open With choice becomes the preference only after opening succeeds.
+    func openInEditor(_ ids: Set<String>, application: EditorApplication? = nil) async {
+        guard let worktree = worktreeToOpenInEditor(ids) else { return }
+        guard let editor = application ?? preferredEditor else {
+            await chooseAndOpenEditor(ids)
+            return
+        }
         do {
-            try await openWorktreeInZed(worktree.path)
+            try await openWorktreeInEditor(worktree.path, editor)
         } catch {
-            errorMessage = "Could not open \(worktree.path) in Zed.\n\(error.localizedDescription)"
+            errorMessage = "Could not open \(worktree.path) in \(editor.name).\n\(error.localizedDescription)"
+            return
+        }
+        if application != nil, settings.preferredEditor != editor {
+            var next = settings
+            next.preferredEditor = editor
+            do {
+                try persist(next)
+                refreshEditorApplications()
+            } catch {
+                errorMessage = "Opened in \(editor.name), but could not save your preferred editor.\n\(error.localizedDescription)"
+            }
         }
     }
 
-    private func worktreeToOpenInZed(_ ids: Set<String>) -> WorktreeRecord? {
+    func chooseAndOpenEditor(_ ids: Set<String>) async {
+        guard canOpenInEditor(ids) else { return }
+        let projectID = selectedProject?.id
+        isChoosingEditor = true
+        let url = chooseEditor()
+        isChoosingEditor = false
+        // The native panel runs a nested event loop. Recheck the original target afterward.
+        guard let url, selectedProject?.id == projectID, canOpenInEditor(ids) else { return }
+        guard let application = editorLauncher.application(at: url) else {
+            errorMessage = "The selected application is unavailable. Choose an installed app with Open With → Other…."
+            return
+        }
+        await openInEditor(ids, application: application)
+    }
+
+    private func worktreeToOpenInEditor(_ ids: Set<String>) -> WorktreeRecord? {
         guard !isDeleting, !isModalPresented, ids.count == 1,
               let id = ids.first, let worktree = selectedProjectSession?.row(id: id)?.row.worktree,
               worktree.exists, !worktree.isBare else { return nil }

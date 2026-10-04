@@ -11,6 +11,7 @@ struct SavedConnection: Codable, Identifiable, Hashable {
 struct AppSettings: Codable {
     var projects: [ProjectRecord] = []
     var connections: [SavedConnection] = []
+    var preferredEditor: EditorApplication?
 }
 
 @MainActor
