@@ -2,22 +2,36 @@
 
 DevBox is a SwiftPM application: no Xcode project is needed. Building requires
 Swift 6.2 or newer and a macOS 26 SDK; running requires **macOS 26 or newer**.
-The workflows use native `macos-26` (Apple Silicon/arm64) and
-`macos-26-intel` (Intel/x86_64) runners, as listed in the
+Supported releases require **Apple Silicon (arm64)**. The workflows use the native
+`macos-26` runner, as listed in the
 [GitHub runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 They check the selected toolchain rather than silently accepting an older SDK.
-These are separate native downloads, not universal binaries.
+Downloads are native arm64 apps, not universal binaries. Intel builds ended with
+[v0.3.0](https://github.com/CodeGradox/devbox/releases/tag/v0.3.0); existing downloads remain available.
+
+## Local tests
+
+Run `make test`, or `sh scripts/test.sh --filter SomeTest` for a focused run.
+Both CI workflows use the same script. It explicitly disables parallel test-case
+scheduling: AppKit tests share `NSApplication` and the main run loop, and
+`.serialized` on separate suites does not serialize those suites against each other.
+Concurrency tests still start their own concurrent workers. No tests are skipped
+and their time limits are unchanged.
+
+App-store fixtures inject an inert editor launcher rather than querying the
+machine's installed applications through `NSWorkspace`. This keeps cold-runner
+editor discovery from blocking unrelated MainActor tests.
 
 ## Local visible-window check
 
 On a logged-in macOS desktop, run:
 
 ```sh
-DEVBOX_UI_TESTS=1 swift test --filter BranchRenderingTests
+DEVBOX_UI_TESTS=1 sh scripts/test.sh --filter 'BranchRenderingTests|WorktreeListRenderingTests'
 ```
 
 This additionally captures only the test's own windows and verifies visible
-sidebar, controls, and branch-row text at minimum and default window widths.
+sidebar, controls, and table-row text at minimum and default window widths.
 It needs no Screen Recording permission and captures no other applications.
 Ordinary bitmap/layout tests alone cannot detect a blank SwiftUI window.
 Optionally set `DEVBOX_BRANCH_SCREENSHOT=/path/to/branches.png` to save the
@@ -26,7 +40,7 @@ captures as `branches.900.png` and `branches.1140.png`.
 ## Ordinary CI: no credentials
 
 `build.yml` runs for pull requests, pushes to `main`, `v*` tags, and manual
-dispatch. Each architecture runs `swift test`, builds an optimized release app,
+dispatch. It runs `sh scripts/test.sh`, builds an optimized arm64 release app,
 checks its architecture, deployment target, and ad hoc signature, and uploads
 app and standalone-executable ZIPs plus SHA-256 checksums. Download them from
 the Actions run's **Artifacts** section. Unpack the outer artifact archive,
@@ -59,8 +73,8 @@ SHAs before changing pins.
 
 ## Version tags publish downloads
 
-After both native builds and tests succeed, a push of a stable version tag
-(`vMAJOR.MINOR.PATCH`) publishes the two app ZIPs and a combined `SHA256SUMS.txt`
+After the native arm64 build and tests succeed, a push of a stable version tag
+(`vMAJOR.MINOR.PATCH`) publishes the app ZIP and its `SHA256SUMS.txt`
 to a GitHub Release. The job downloads only artifacts from that same workflow run
 and checks their hashes before uploading. It publishes from a draft only after
 all assets have uploaded successfully; failed uploads leave an unpublished draft.
@@ -76,7 +90,7 @@ git push origin refs/tags/v0.1.0
 
 For later releases use a new version; do not move an existing release tag.
 Download from [the latest release](https://github.com/CodeGradox/devbox/releases/latest)
-or the README's architecture-specific links. Release assets have no Actions
+or the README's Apple Silicon link. Release assets have no Actions
 retention expiry or extra artifact-wrapper ZIP. Private repositories still require
 GitHub authentication/access; this workflow never changes repository visibility.
 These downloads remain **ad-hoc signed and non-notarized**.
@@ -87,7 +101,7 @@ These downloads remain **ad-hoc signed and non-notarized**.
 via **Run workflow** on `main`, uses the protected `release` environment, and
 uploads stapled app archives; it does **not** create or publish GitHub Releases.
 There is no arbitrary checkout-ref input. Selecting any other branch or tag
-skips the signing job. It signs both native architectures independently.
+skips the signing job. It signs the native arm64 app.
 
 Before enabling it:
 
@@ -158,8 +172,8 @@ ID in the log and retrieve diagnostics through your approved developer tools.
   Neither archive bundles or downloads this library, nor installs/starts a
   database server. Install a compatible native MariaDB connector (for example
   `brew install mariadb-connector-c`) or supported MariaDB server package and
-  configure the local database separately. Apple Silicon normally uses
-  `/opt/homebrew`; Intel normally uses `/usr/local`. Library architecture must
+  configure the local database separately. Native Apple Silicon Homebrew normally
+  uses `/opt/homebrew`. The client library must be arm64 to
   match the app. The app's database diagnostics explain missing-library cases.
 - Developer ID builds use only
   `com.apple.security.cs.disable-library-validation` as a hardened-runtime

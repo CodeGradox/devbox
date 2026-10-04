@@ -116,7 +116,8 @@ func projectSessionRestoresSnapshotUntilExplicitRefreshAndDoesNotPersistIt() asy
     persistence.value.projects = [a, b]
     let probe = SessionSizeProbe()
     let store = AppStore(persistence: persistence, credentials: SessionCredentials(),
-                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }))
+                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }),
+                         editorLauncher: inertEditorLauncher())
     store.loadSelection()
     await waitForSessionLoad(store)
     let original = try #require(store.worktrees.first)
@@ -153,7 +154,8 @@ func projectSessionRestoresSnapshotUntilExplicitRefreshAndDoesNotPersistIt() asy
 
     try Data("another external change".utf8).write(to: fixture.a.appendingPathComponent("another.txt"))
     let reopened = AppStore(persistence: persistence, credentials: SessionCredentials(),
-                            sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }))
+                            sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }),
+                            editorLauncher: inertEditorLauncher())
     reopened.loadSelection()
     await waitForSessionLoad(reopened)
     let fresh = try #require(reopened.worktrees.first)
@@ -171,7 +173,8 @@ func projectRefreshPreservesVisibleRowsWhileAwaitingMeasurements() async throws 
     persistence.value.projects = [try await GitService().discoverProject(at: fixture.a.path)]
     let probe = SessionSizeProbe()
     let store = AppStore(persistence: persistence, credentials: SessionCredentials(),
-                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }))
+                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }),
+                         editorLauncher: inertEditorLauncher())
     store.loadSelection()
     await waitForSessionLoad(store)
     let session = try #require(store.selectedProjectSession)
@@ -216,7 +219,8 @@ func rowMeasurementAndFailureRemainInProjectSessionAfterSwitching() async throws
     persistence.value.projects = [a, b]
     let probe = SessionSizeProbe()
     let store = AppStore(persistence: persistence, credentials: SessionCredentials(),
-                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }))
+                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }),
+                         editorLauncher: inertEditorLauncher())
     store.loadSelection()
     await waitForSessionLoad(store)
     let id = try #require(store.worktrees.first?.id)
@@ -261,7 +265,8 @@ func returningToProjectResumesOnlyUnfinishedSizeMeasurements() async throws {
     let probe = SessionSizeProbe()
     await probe.holdLinkedScans()
     let store = AppStore(persistence: persistence, credentials: SessionCredentials(),
-                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }))
+                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }),
+                         editorLauncher: inertEditorLauncher())
     store.loadSelection()
     for await rows in Observations({ store.worktrees }) {
         if rows.contains(where: { $0.worktree.isMain && $0.measuredAt != nil }) { break }
@@ -297,7 +302,8 @@ func canceledDeletionDoesNotForgetPendingRemeasurement() async throws {
     persistence.value.projects = [a, b]
     let probe = SessionSizeProbe()
     let store = AppStore(persistence: persistence, credentials: SessionCredentials(),
-                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }))
+                         sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }),
+                         editorLauncher: inertEditorLauncher())
     store.loadSelection()
     await waitForSessionLoad(store)
     let linked = try #require(store.worktrees.first { !$0.worktree.isMain })

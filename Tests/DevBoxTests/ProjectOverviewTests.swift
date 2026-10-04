@@ -240,7 +240,8 @@ func projectOverviewCachesMetadataChangesOnlyBranchTargetAndRefreshesAllMeasurem
                 scan: { await probe.usage("checkout:" + $0.id) },
                 gitStorageScan: { await probe.usage("git:" + $0.id) }
             ),
-            inspectBranches: { project, _ in await probe.inspect(project) }
+            inspectBranches: { project, _ in await probe.inspect(project) },
+            editorLauncher: inertEditorLauncher()
         )
     }
     let store = makeStore()

@@ -43,7 +43,7 @@ func failedSettingsWriteRestoresPreviousPassword() throws {
     persistence.value.connections = [original]
     credentials.values[original.id] = "old test password"
     persistence.failWrite = true
-    let store = AppStore(persistence: persistence, credentials: credentials)
+    let store = AppStore(persistence: persistence, credentials: credentials, editorLauncher: inertEditorLauncher())
     var updated = original
     updated.name = "Changed"
     #expect(throws: TestFailure.self) {
@@ -59,7 +59,7 @@ func failedNewConnectionWriteRemovesOrphanCredential() {
     let persistence = MemorySettings()
     let credentials = MemoryCredentials()
     persistence.failWrite = true
-    let store = AppStore(persistence: persistence, credentials: credentials)
+    let store = AppStore(persistence: persistence, credentials: credentials, editorLauncher: inertEditorLauncher())
     let connection = SavedConnection(name: "New", settings: .init())
     #expect(throws: TestFailure.self) {
         try store.saveConnection(connection, password: "test password")
@@ -73,7 +73,7 @@ func unreadableSettingsAreNeverOverwritten() {
     let persistence = MemorySettings()
     let credentials = MemoryCredentials()
     persistence.failRead = true
-    let store = AppStore(persistence: persistence, credentials: credentials)
+    let store = AppStore(persistence: persistence, credentials: credentials, editorLauncher: inertEditorLauncher())
     #expect(store.errorMessage != nil)
     #expect(throws: (any Error).self) {
         try store.saveConnection(.init(name: "New", settings: .init()), password: "")
@@ -84,7 +84,7 @@ func unreadableSettingsAreNeverOverwritten() {
 
 @Test @MainActor
 func destinationChangeClearsBothSelections() {
-    let store = AppStore(persistence: MemorySettings(), credentials: MemoryCredentials())
+    let store = AppStore(persistence: MemorySettings(), credentials: MemoryCredentials(), editorLauncher: inertEditorLauncher())
     store.worktreeSelection = ["/previous-project/worktree"]
     store.databaseSelection = ["previous_database"]
     store.destination = .project("another-project")
@@ -97,7 +97,7 @@ func authenticationFailureDoesNotStartDeletionOrCloseConfirmation() async {
     let persistence = MemorySettings()
     let credentials = MemoryCredentials()
     var authenticationCalls = 0
-    let store = AppStore(persistence: persistence, credentials: credentials, authenticate: { _ in
+    let store = AppStore(persistence: persistence, credentials: credentials, editorLauncher: inertEditorLauncher(), authenticate: { _ in
         authenticationCalls += 1
         throw TestFailure.expected
     })
@@ -117,7 +117,7 @@ func authenticationFailureDoesNotStartDeletionOrCloseConfirmation() async {
 @Test @MainActor
 func staleConfirmationCannotRequestAuthentication() async {
     var authenticationCalls = 0
-    let store = AppStore(persistence: MemorySettings(), credentials: MemoryCredentials(), authenticate: { _ in
+    let store = AppStore(persistence: MemorySettings(), credentials: MemoryCredentials(), editorLauncher: inertEditorLauncher(), authenticate: { _ in
         authenticationCalls += 1
     })
     let connection = SavedConnection(name: "Test", settings: .init())
@@ -130,7 +130,8 @@ func staleConfirmationCannotRequestAuthentication() async {
 @Test @MainActor
 func resultsWaitUntilConfirmationDismissal() async throws {
     let store = AppStore(
-        persistence: MemorySettings(), credentials: MemoryCredentials(), authenticate: { _ in }
+        persistence: MemorySettings(), credentials: MemoryCredentials(),
+        editorLauncher: inertEditorLauncher(), authenticate: { _ in }
     )
     let connection = SavedConnection(name: "Test", settings: .init())
     let request = DeletionRequest(items: .databases(connection, [.init(name: "never_contacted")]))
@@ -236,6 +237,7 @@ func openInEditorUsesRequestedWorktreeWithoutChangingSelectionOrBranches() async
     var openedPaths: [String] = []
     let store = AppStore(
         persistence: persistence, credentials: MemoryCredentials(),
+        editorLauncher: inertEditorLauncher(),
         openWorktreeInEditor: { path, editor in
             #expect(editor == testEditorApplication)
             openedPaths.append(path)
@@ -284,6 +286,7 @@ func openInEditorRejectsInvalidSelectionsAndAllowsLockedOrDetachedWorktrees() as
     var openedPaths: [String] = []
     let store = AppStore(
         persistence: persistence, credentials: MemoryCredentials(),
+        editorLauncher: inertEditorLauncher(),
         openWorktreeInEditor: { path, _ in openedPaths.append(path) }
     )
     store.refresh()
@@ -335,6 +338,7 @@ func openInEditorShowsLaunchFailureWithWorktreePath() async throws {
     persistence.value.preferredEditor = testEditorApplication
     let store = AppStore(
         persistence: persistence, credentials: MemoryCredentials(),
+        editorLauncher: inertEditorLauncher(),
         openWorktreeInEditor: { _, _ in
             throw NSError(domain: "EditorTest", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "The editor could not be launched."
@@ -361,7 +365,7 @@ func rowRefreshChangesOnlyItsMeasurementAndPreservesSelection() async throws {
     persistence.value.projects = [try await GitService().discoverProject(at: fixture.repository.path)]
     let probe = StoreSizeProbe()
     let queue = WorktreeSizeQueue(scan: { try await probe.scan($0) })
-    let store = AppStore(persistence: persistence, credentials: MemoryCredentials(), sizeQueue: queue)
+    let store = AppStore(persistence: persistence, credentials: MemoryCredentials(), sizeQueue: queue, editorLauncher: inertEditorLauncher())
     store.refresh()
     await waitForGitStatus(store)
     await waitForSizes(store)
@@ -399,7 +403,7 @@ func slowSizeScansDoNotBlockGitRefreshOrDeletionConfirmation() async throws {
     let probe = StoreSizeProbe()
     await probe.hold()
     let queue = WorktreeSizeQueue(scan: { try await probe.scan($0) })
-    let store = AppStore(persistence: persistence, credentials: MemoryCredentials(), sizeQueue: queue)
+    let store = AppStore(persistence: persistence, credentials: MemoryCredentials(), sizeQueue: queue, editorLauncher: inertEditorLauncher())
     store.refresh()
     await waitForGitStatus(store)
     #expect(store.isMeasuringSizes)

@@ -1,5 +1,5 @@
 name: Manual Developer ID notarized apps
-run-name: Notarized arm64 and x86_64 apps from trusted main
+run-name: Notarized arm64 app from trusted main
 
 on:
   workflow_dispatch:
@@ -11,20 +11,12 @@ jobs:
   release:
     # No user-supplied ref input: only reviewed main may access credentials.
     if: github.ref == 'refs/heads/main'
-    name: Sign and notarize ${{ matrix.arch }}
+    name: Sign and notarize arm64
     environment: release
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-26
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-26
-            arch: arm64
-          - runner: macos-26-intel
-            arch: x86_64
     env:
-      ARCH: ${{ matrix.arch }}
+      ARCH: arm64
     steps:
       - name: Isolate build outputs
         run: |
@@ -47,7 +39,7 @@ jobs:
           assert int(sdk.split(".")[0]) >= 26, sdk
           PY
           unset DEVBOX_TEST_MARIADB_SOCKET
-          swift test --scratch-path "$SWIFT_BUILD_PATH"
+          sh scripts/test.sh
       - name: Import ephemeral identity, sign, notarize and staple
         env:
           DEVBOX_CERTIFICATE_BASE64: ${{ secrets.DEVBOX_CERTIFICATE_BASE64 }}
@@ -83,7 +75,7 @@ jobs:
       - name: Upload notarized app (does not publish a GitHub Release)
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: DevBox-macos26-${{ matrix.arch }}-developer-id-notarized
+          name: DevBox-macos26-arm64-developer-id-notarized
           path: artifacts/
           if-no-files-found: error
           compression-level: 0

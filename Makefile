@@ -5,7 +5,7 @@ BENCH_RUNS ?= 5
 .PHONY: test test-mariadb build run benchmark
 
 test:
-	swift test
+	sh scripts/test.sh
 
 test-mariadb:
 	sh scripts/test-mariadb.sh

@@ -52,6 +52,7 @@ struct DeletionRenderingTests {
                 signalStarted.yield(())
                 for await _ in finished { break }
             },
+            editorLauncher: inertEditorLauncher(),
             authenticate: { _ in }
         )
         let request = DeletionRequest(items: .worktrees(

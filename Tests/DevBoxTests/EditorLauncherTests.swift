@@ -44,6 +44,7 @@ struct EditorLauncherTests {
         var recoveredURL: URL?
         var opened: [URL] = []
         let launcher = EditorLauncher(
+            findApplications: { [] },
             findApplication: { _ in recoveredURL },
             openURLs: { _, url, _ in opened.append(url) }
         )
@@ -81,6 +82,7 @@ struct EditorLauncherTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         var opened = false
         let launcher = EditorLauncher(
+            findApplications: { [] },
             describeApplication: { $0 == editor.url ? editor : nil },
             findApplication: { _ in
                 Issue.record("An installed selection must win over bundle-ID discovery")
@@ -110,6 +112,7 @@ struct EditorLauncherTests {
         let launcher = EditorLauncher(
             findApplications: { [second.url, invalid, first.url, alpha.url, first.url] },
             describeApplication: { url in apps.first { $0.url == url } },
+            findApplication: { _ in nil },
             openURLs: { _, _, _ in Issue.record("Discovery must not launch") }
         )
         #expect(launcher.applicationsForFolders() == apps)
@@ -128,6 +131,7 @@ struct EditorLauncherTests {
         var oldPathOccupied = false
         var opened: [URL] = []
         let launcher = EditorLauncher(
+            findApplications: { [] },
             describeApplication: { url in
                 if url == moved.url { return moved }
                 return oldPathOccupied && url == editor.url ? unrelated : nil
@@ -151,6 +155,7 @@ struct EditorLauncherTests {
         defer { try? FileManager.default.removeItem(at: fixture) }
         var installed: EditorApplication? = nil
         let launcher = EditorLauncher(
+            findApplications: { [] },
             describeApplication: { _ in installed },
             findApplication: { _ in editor.url },
             openURLs: { _, _, _ in Issue.record("Must not substitute another app") }
@@ -170,8 +175,10 @@ struct EditorLauncherTests {
         let anonymous = EditorApplication(url: editor.url, name: "Anonymous", bundleIdentifier: nil)
         var installed: EditorApplication? = anonymous
         let launcher = EditorLauncher(
+            findApplications: { [] },
             describeApplication: { _ in installed },
-            findApplication: { _ in Issue.record("Cannot recover without identity"); return nil }
+            findApplication: { _ in Issue.record("Cannot recover without identity"); return nil },
+            openURLs: { _, _, _ in Issue.record("Resolution must not launch") }
         )
         #expect(launcher.resolvedApplication(anonymous) == anonymous)
         installed = editor
@@ -188,6 +195,7 @@ struct EditorLauncherTests {
         let file = fixture.appendingPathComponent("file")
         try Data("not a directory".utf8).write(to: file)
         let launcher = EditorLauncher(
+            findApplications: { [] },
             describeApplication: { _ in Issue.record("Validate folder first"); return nil },
             findApplication: { _ in Issue.record("Validate folder first"); return nil },
             openURLs: { _, _, _ in Issue.record("Must not open invalid paths") }
@@ -211,6 +219,7 @@ struct EditorLauncherTests {
         var installed = true
         var openCount = 0
         let launcher = EditorLauncher(
+            findApplications: { [] },
             describeApplication: { _ in installed ? editor : nil },
             findApplication: { _ in nil },
             openURLs: { _, _, _ in openCount += 1 }
@@ -235,7 +244,9 @@ struct EditorLauncherTests {
             NSLocalizedDescriptionKey: "Native launch failed"
         ])
         let launcher = EditorLauncher(
+            findApplications: { [] },
             describeApplication: { _ in editor },
+            findApplication: { _ in nil },
             openURLs: { _, _, _ in throw failure }
         )
         do {
@@ -264,7 +275,11 @@ struct EditorLauncherTests {
         // Only a fixture executable: tests never ask NSWorkspace to launch it.
         try Data("#!/bin/sh\nexit 0\n".utf8).write(to: executable)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
-        let launcher = EditorLauncher(openURLs: { _, _, _ in Issue.record("Must not launch fixtures") })
+        let launcher = EditorLauncher(
+            findApplications: { [] },
+            findApplication: { _ in nil },
+            openURLs: { _, _, _ in Issue.record("Must not launch fixtures") }
+        )
         #expect(launcher.application(at: app) == EditorApplication(
             url: app, name: "Sample Display", bundleIdentifier: "example.sample"
         ))

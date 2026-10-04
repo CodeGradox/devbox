@@ -80,6 +80,7 @@ private func branchStore(_ probe: BranchOperations, authenticate: @escaping @Mai
         listManagedBranches: { await probe.list($0) },
         fetchManagedBranches: { try await probe.fetch($0) },
         deleteBranch: { branch, _, force in try await probe.delete(branch, force: force) },
+        editorLauncher: inertEditorLauncher(),
         authenticate: authenticate
     )
 }
@@ -253,7 +254,8 @@ func lateBranchLoadCannotReplaceAnotherProject() async throws {
     let probe = SuspendedBranchList()
     let store = AppStore(
         persistence: persistence, credentials: BranchCredentials(),
-        listManagedBranches: { await probe.load($0) }
+        listManagedBranches: { await probe.load($0) },
+        editorLauncher: inertEditorLauncher()
     )
     store.projectSection = .branches
     await probe.waitUntilSuspended()
@@ -301,7 +303,8 @@ func changingProjectsDuringFetchDoesNotPublishObsoleteResults() async throws {
     let store = AppStore(
         persistence: persistence, credentials: BranchCredentials(),
         listManagedBranches: { await operations.list($0) },
-        fetchManagedBranches: { _ in await probe.fetch() }
+        fetchManagedBranches: { _ in await probe.fetch() },
+        editorLauncher: inertEditorLauncher()
     )
     store.projectSection = .branches
     await waitForBranchLoad(store)

@@ -1,7 +1,7 @@
 # DevBox
 
 A native macOS app for managing Git worktrees, branches, and local MariaDB databases.
-Requires **macOS 26 or newer**.
+Requires **Apple Silicon (M1 or newer) and macOS 26 or newer**.
 
 ## Features
 
@@ -64,7 +64,9 @@ guarantee of how much disk space deletion will reclaim.
 Get the app from the [latest release](https://github.com/CodeGradox/devbox/releases/latest):
 
 - [Apple Silicon (M1 and newer)](https://github.com/CodeGradox/devbox/releases/latest/download/DevBox-macos26-arm64-adhoc-non-notarized-app.zip)
-- [Intel](https://github.com/CodeGradox/devbox/releases/latest/download/DevBox-macos26-x86_64-adhoc-non-notarized-app.zip)
+
+Releases from v0.3.1 onward are Apple Silicon-only. The last Intel build remains
+available in [v0.3.0](https://github.com/CodeGradox/devbox/releases/tag/v0.3.0).
 
 Unzip the download and move **DevBox.app** into **Applications**.
 If the repository is private, you need GitHub access to download it.

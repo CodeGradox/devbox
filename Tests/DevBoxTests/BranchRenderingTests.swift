@@ -70,7 +70,10 @@ struct BranchRenderingTests {
                 githubURL: URL(string: "https://github.com/example/repo/tree/feature%2Fbranch-manager")
             )
         ]
-        let store = AppStore(persistence: persistence, listManagedBranches: { _ in branches })
+        let store = AppStore(
+            persistence: persistence, listManagedBranches: { _ in branches },
+            editorLauncher: inertEditorLauncher()
+        )
         store.projectSection = .branches
         for await refreshing in Observations({ store.isRefreshing }) {
             if !refreshing { break }
@@ -122,7 +125,7 @@ struct BranchRenderingTests {
             #expect(table.tableColumns[3].sortDescriptorPrototype == nil)
             // Native table membership and cacheDisplay can pass while SwiftUI's
             // on-screen content is completely blank. Opt in on a GUI session:
-            // DEVBOX_UI_TESTS=1 swift test --filter BranchRenderingTests
+            // DEVBOX_UI_TESTS=1 sh scripts/test.sh --filter BranchRenderingTests
             if ProcessInfo.processInfo.environment["DEVBOX_UI_TESTS"] == "1" {
                 let image = try await capture(window)
                 let request = VNRecognizeTextRequest()

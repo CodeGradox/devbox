@@ -80,6 +80,7 @@ private func deletionFixture(
         dropDatabase: { row, _, password in
             try await probe.run(row.name, password: password)
         },
+        editorLauncher: inertEditorLauncher(),
         authenticate: authenticate
     )
     store.deletionRequest = request

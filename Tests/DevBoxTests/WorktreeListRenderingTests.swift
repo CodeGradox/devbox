@@ -22,6 +22,7 @@ struct WorktreeListRenderingTests {
         let store = AppStore(
             persistence: WorktreeRenderingSettings(),
             removeWorktree: { _, _ in Issue.record("Review must not delete a worktree.") },
+            editorLauncher: inertEditorLauncher(),
             authenticate: { _ in Issue.record("Review must not authenticate before confirmation.") }
         )
         let session = try #require(store.selectedProjectSession)

@@ -57,4 +57,4 @@ CREATE TABLE `devbox_integration_``資料`.`history_``資料` (id INT PRIMARY KE
 CREATE USER 'devbox_metadata_reader'@'localhost' IDENTIFIED BY '';
 GRANT SELECT ON `devbox_integration_plain`.`records` TO 'devbox_metadata_reader'@'localhost';
 SQL
-DEVBOX_TEST_MARIADB_SOCKET="$socket" swift test --filter 'Database(Service|Integration)Tests'
+DEVBOX_TEST_MARIADB_SOCKET="$socket" sh scripts/test.sh --filter 'Database(Service|Integration)Tests'

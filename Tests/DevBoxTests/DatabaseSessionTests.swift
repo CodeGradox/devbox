@@ -93,7 +93,8 @@ struct DatabaseSessionTests {
     ) -> AppStore {
         AppStore(persistence: settings, credentials: credentials,
                  listDatabases: { _, _ in try await probe.inventory() },
-                 loadStatistics: { _, _ in try await probe.statistics() })
+                 loadStatistics: { _, _ in try await probe.statistics() },
+                 editorLauncher: inertEditorLauncher())
     }
 
     private func completed(_ session: DatabaseSessionState) async {
@@ -270,6 +271,7 @@ struct DatabaseSessionTests {
             dropDatabase: { _, _, _ in _ = try await deletion.statistics() },
             listDatabases: { _, _ in try await metadata.inventory() },
             loadStatistics: { _, _ in try await metadata.statistics() },
+            editorLauncher: inertEditorLauncher(),
             authenticate: { _ in }
         )
         store.loadSelection()

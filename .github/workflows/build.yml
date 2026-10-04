@@ -12,21 +12,13 @@ permissions:
 
 jobs:
   build:
-    name: Test and package ${{ matrix.arch }} (ad hoc, non-notarized)
-    runs-on: ${{ matrix.runner }}
+    name: Test and package arm64 (ad hoc, non-notarized)
+    runs-on: macos-26
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-26
-            arch: arm64
-          - runner: macos-26-intel
-            arch: x86_64
     env:
       CONFIGURATION: release
       DEVBOX_SIGNING_IDENTITY: '-'
-      ARCH: ${{ matrix.arch }}
+      ARCH: arm64
     steps:
       - name: Isolate build outputs
         run: |
@@ -56,7 +48,7 @@ jobs:
       - name: Test without database integration
         run: |
           unset DEVBOX_TEST_MARIADB_SOCKET
-          swift test --scratch-path "$SWIFT_BUILD_PATH"
+          sh scripts/test.sh
       - name: Build release app
         run: sh scripts/build-app.sh
       - name: Verify and archive app and executable
@@ -89,7 +81,7 @@ jobs:
       - name: Upload ad hoc, non-notarized downloads
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: DevBox-macos26-${{ matrix.arch }}-adhoc-non-notarized
+          name: DevBox-macos26-arm64-adhoc-non-notarized
           path: artifacts/
           if-no-files-found: error
           compression-level: 0
@@ -117,13 +109,11 @@ jobs:
           set -euo pipefail
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           mkdir -p downloads
-          for arch in arm64 x86_64; do
-            gh run download "$GITHUB_RUN_ID" \
-              --name "DevBox-macos26-$arch-adhoc-non-notarized" \
-              --dir "$RUNNER_TEMP/build-$arch"
-            (cd "$RUNNER_TEMP/build-$arch" && sha256sum --check SHA256SUMS.txt)
-            cp "$RUNNER_TEMP/build-$arch/DevBox-macos26-$arch-adhoc-non-notarized-app.zip" downloads/
-          done
+          gh run download "$GITHUB_RUN_ID" \
+            --name "DevBox-macos26-arm64-adhoc-non-notarized" \
+            --dir "$RUNNER_TEMP/build-arm64"
+          (cd "$RUNNER_TEMP/build-arm64" && sha256sum --check SHA256SUMS.txt)
+          cp "$RUNNER_TEMP/build-arm64/DevBox-macos26-arm64-adhoc-non-notarized-app.zip" downloads/
           (cd downloads && sha256sum ./*.zip > SHA256SUMS.txt)
       - name: Publish complete release
         run: |
@@ -131,10 +121,12 @@ jobs:
           cat > notes.md <<EOF
           ## Downloads
 
-          Requires **macOS 26 or newer**.
+          Requires **Apple Silicon (M1 or newer) and macOS 26 or newer**.
 
           - [Apple Silicon (M1 and newer)](https://github.com/$GH_REPO/releases/download/$TAG/DevBox-macos26-arm64-adhoc-non-notarized-app.zip)
-          - [Intel](https://github.com/$GH_REPO/releases/download/$TAG/DevBox-macos26-x86_64-adhoc-non-notarized-app.zip)
+
+          Starting with v0.3.1, releases are Apple Silicon-only. The last Intel download
+          remains available in [v0.3.0](https://github.com/$GH_REPO/releases/tag/v0.3.0).
 
           Extract the ZIP and move **DevBox.app** into Applications.
 
