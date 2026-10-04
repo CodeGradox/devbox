@@ -220,12 +220,24 @@ private struct ProjectView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 260)
+                .labelsHidden()
+                .fixedSize()
                 .disabled(store.isDeleting || store.isModalPresented)
                 Spacer()
+                if store.projectSection == .worktrees {
+                    CompactProjectSizeView(session: session)
+                } else {
+                    Text(project.path)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(project.path)
+                }
             }
-            .padding(.horizontal, 20)
-            .padding(.top, 12)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .help(project.path)
+            Divider()
             switch store.projectSection {
             case .worktrees:
                 WorktreesView(project: project, session: session)
@@ -242,29 +254,41 @@ struct WorktreesView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            WorktreesHeader(project: project, session: session)
-            MergeTargetPicker(project: project, session: session)
+            WorktreeCleanupSuggestions(session: session)
+            WorktreeControls(session: session)
             WorktreeTable(session: session)
             WorktreesFooter(session: session)
         }
     }
 }
 
-private struct WorktreesHeader: View {
-    let project: ProjectRecord
+private struct WorktreeControls: View {
     let session: ProjectSessionState
 
     var body: some View {
-        DetailHeader(
-            title: "Worktrees",
-            subtitle: project.path,
-            symbol: "arrow.triangle.branch"
-        ) {
-            ProjectSizeView(
-                summary: session.summary,
-                presentation: session.sizePresentation
-            )
+        @Bindable var session = session
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                Picker("Show worktrees", selection: $session.filter) {
+                    ForEach(WorktreeFilter.allCases) { filter in
+                        Text("\(filter.rawValue) \(session.filterCounts[filter])").tag(filter)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 310)
+                Spacer(minLength: 0)
+                MergeTargetPicker(session: session)
+            }
+            if let warning = session.branchPresentation.warning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
     }
 }
 
@@ -274,30 +298,31 @@ private struct WorktreeTable: View {
 
     var body: some View {
         @Bindable var store = store
+        @Bindable var session = session
         if let error = store.loadError {
             LoadErrorView(message: error, retry: store.refresh)
         } else {
-            Table(session.rows, selection: $store.worktreeSelection) {
-                TableColumn("Worktree") { state in
-                    WorktreeNameCell(state: state)
+            Table(session.tableRows, selection: $store.worktreeSelection, sortOrder: $session.sortOrder) {
+                TableColumn("Worktree", sortUsing: WorktreeSort(column: .name)) { row in
+                    WorktreeNameCell(state: row.state)
                 }
-                .width(min: 180, ideal: 300)
-                TableColumn("Branch") { state in
-                    WorktreeBranchCell(state: state)
+                .width(min: 110, ideal: 170)
+                TableColumn("Branch", sortUsing: WorktreeSort(column: .branch)) { row in
+                    WorktreeBranchCell(state: row.state)
                 }
-                .width(min: 90, ideal: 150)
-                TableColumn("Git Status") { state in
-                    WorktreeStatusCell(state: state)
+                .width(min: 90, ideal: 120)
+                TableColumn("Changes", sortUsing: WorktreeSort(column: .changes)) { row in
+                    WorktreeStatusCell(state: row.state)
                 }
-                .width(min: 130, ideal: 190)
-                TableColumn("Merge Status") { state in
-                    WorktreeLifecycleCell(state: state)
+                .width(min: 95, ideal: 105, max: 120)
+                TableColumn("Merged", sortUsing: WorktreeSort(column: .merged)) { row in
+                    WorktreeLifecycleCell(state: row.state)
                 }
-                .width(min: 115, ideal: 150)
-                TableColumn("Disk Usage") { state in
-                    WorktreeSizeCell(state: state, store: store)
+                .width(min: 70, ideal: 80, max: 100)
+                TableColumn("Disk", sortUsing: WorktreeSort(column: .size)) { row in
+                    WorktreeSizeCell(state: row.state, store: store)
                 }
-                .width(min: 155, ideal: 180)
+                .width(min: 110, ideal: 120, max: 155)
             }
             .contextMenu(forSelectionType: String.self) { ids in
                 WorktreeContextMenu(session: session, store: store, ids: ids)
@@ -305,7 +330,20 @@ private struct WorktreeTable: View {
                 Task { await store.openInEditor(ids) }
             }
             .overlay {
-                if session.rows.isEmpty && store.isRefreshing { ProgressView("Loading worktrees…") }
+                if session.tableRows.isEmpty {
+                    if store.isRefreshing {
+                        ProgressView("Loading worktrees…")
+                    } else {
+                        ContentUnavailableView(
+                            "No Worktrees", systemImage: "folder",
+                            description: Text("No worktrees match the current filter.")
+                        )
+                    }
+                }
+            }
+            .onChange(of: session.tableRows.map(\.id), initial: true) { _, ids in
+                let selection = store.worktreeSelection.intersection(ids)
+                if selection != store.worktreeSelection { store.worktreeSelection = selection }
             }
         }
     }
@@ -330,7 +368,6 @@ private struct WorktreesFooter: View {
 
 private struct MergeTargetPicker: View {
     @Environment(AppStore.self) private var store
-    let project: ProjectRecord
     let session: ProjectSessionState
 
     private var mergeTargetLabel: String {
@@ -340,36 +377,21 @@ private struct MergeTargetPicker: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                HStack(spacing: 8) {
-                    Text("Merge target").accessibilityHidden(true)
-                    BranchTargetPopUpButton(
-                        options: session.branchPresentation.options,
-                        selection: Binding<String?>(
-                            get: { store.selectedProject?.mergeTarget },
-                            set: { store.changeMergeTarget($0) }
-                        )
-                    )
-                }
-                .frame(maxWidth: 300)
-                .disabled(store.isDeleting || store.isModalPresented || session.branchPresentation.isLoading)
-                Spacer()
-                Text("Compared with \(mergeTargetLabel)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            if let warning = session.branchPresentation.warning {
-                Label(warning, systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
+        HStack(spacing: 6) {
+            Text("Compare with")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            BranchTargetPopUpButton(
+                options: session.branchPresentation.options,
+                selection: Binding<String?>(
+                    get: { store.selectedProject?.mergeTarget },
+                    set: { store.changeMergeTarget($0) }
+                )
+            )
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 10)
+        .frame(maxWidth: 330)
+        .disabled(store.isDeleting || store.isModalPresented || session.branchPresentation.isLoading)
+        .help("Commit ancestry compared with \(mergeTargetLabel). Uncommitted changes are shown separately.")
     }
 
 }
@@ -383,29 +405,18 @@ struct WorktreeDiskUsageCell: View {
     var presentation: WorktreePresentation? = nil
 
     var body: some View {
-        HStack(spacing: 10) {
-            VStack(alignment: .trailing, spacing: 3) {
-                if let presentation {
-                    Text(presentation.sizeText)
-                        .monospacedDigit()
-                        .foregroundStyle(row.usage == nil ? .secondary : .primary)
-                    if let detail = presentation.sizeDetail {
-                        Text(detail)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                } else if let usage = row.usage {
-                    Text(ByteCountFormatter.string(fromByteCount: usage.bytes, countStyle: .file))
-                        .monospacedDigit()
-                    Text(detail(usage))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(placeholder).foregroundStyle(.secondary)
-                }
+        let display = presentation ?? WorktreePresentation(row: row)
+        HStack(spacing: 8) {
+            Text(display.sizeText)
+                .monospacedDigit()
+                .foregroundStyle(row.usage == nil ? .secondary : .primary)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+            if row.usage != nil && (row.usageError != nil || (row.usage?.unreadableCount ?? 0) > 0
+                || (row.sizeRefreshPending && !row.isSizeBusy)) {
+                Image(systemName: "exclamationmark.circle")
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Partial or last-known measurement")
             }
-            .frame(maxWidth: .infinity, alignment: .trailing)
-            .help(presentation?.sizeHelp ?? usageHelp)
             if row.worktree.exists && !row.worktree.isBare {
                 Button {
                     onRefresh()
@@ -419,35 +430,12 @@ struct WorktreeDiskUsageCell: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(!canRefresh)
-                .help(row.isSizeBusy ? placeholder : "Refresh this worktree’s size and file count")
-                .accessibilityLabel("Refresh size and file count for \(presentation?.folderName ?? URL(fileURLWithPath: row.worktree.path).lastPathComponent)")
+                .help(row.isSizeBusy ? "Size measurement pending" : "Refresh this worktree’s size and file count")
+                .accessibilityLabel("Refresh size and file count for \(display.folderName)")
             }
         }
-    }
-
-    private var placeholder: String {
-        if !row.worktree.exists || row.worktree.isBare { return "—" }
-        switch row.sizeState {
-        case .queued: return "Queued…"
-        case .scanning: return "Scanning…"
-        case .idle: return row.usageError == nil ? "Not measured" : "Unavailable"
-        }
-    }
-
-    private func detail(_ usage: DiskUsage) -> String {
-        let count = "\(usage.fileCount.formatted()) files"
-        if row.sizeState == .queued { return count + " · queued" }
-        if row.sizeState == .scanning { return count + " · updating" }
-        if row.usageError != nil { return count + " · update failed" }
-        return count + (usage.unreadableCount > 0 ? " · partial" : "")
-    }
-
-    private var usageHelp: String {
-        var text = "Exclusive allocated disk usage, including ignored files. Shared Git storage and registered nested worktrees are excluded. APFS sharing means actual space recovered may differ."
-        if let date = row.measuredAt { text += "\nLast measured \(date.formatted(date: .abbreviated, time: .standard))." }
-        if let usage = row.usage, usage.unreadableCount > 0 { text += "\n\(usage.unreadableCount) entries could not be read." }
-        if let error = row.usageError { text += "\nRefresh failed: \(error)" }
-        return text
+        .lineLimit(1)
+        .help([display.sizeDetail, display.sizeHelp].compactMap { $0 }.joined(separator: "\n"))
     }
 }
 

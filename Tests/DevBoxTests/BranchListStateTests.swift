@@ -42,7 +42,7 @@ struct BranchListStateTests {
         let unknown = branch("refs/heads/unknown")
         session.reconcile([unknown, oldest, newest])
         #expect(session.rows.map(\.id) == [newest.reference, oldest.reference, unknown.reference])
-        session.sort = .oldest
+        session.sortOrder = [.init(column: .date)]
         #expect(session.rows.map(\.id) == [oldest.reference, newest.reference, unknown.reference])
     }
 
@@ -51,7 +51,7 @@ struct BranchListStateTests {
         let a = branch("refs/heads/alpha", name: "Alpha")
         let b = branch("refs/heads/beta", name: "Beta", committer: "Sam", email: "sam@example.org")
         session.reconcile([b, a])
-        session.sort = .name
+        session.sortOrder = [.init(column: .branch)]
         #expect(session.rows.map(\.id) == [a.reference, b.reference])
         session.selection = [a.reference, b.reference]
         session.query = " ALPHA "
@@ -95,6 +95,77 @@ struct BranchListStateTests {
         #expect(session.selection == [a.reference])
         #expect(session.fetchDescription.contains("Last fetched"))
         #expect(session.rows[0].commitHelp.contains(a.commit))
+    }
+
+    @Test func headerSortingBothDirectionsAndDeterministicTies() {
+        let session = BranchListState()
+        let a = branch("refs/heads/a", name: "Alpha", date: Date(timeIntervalSince1970: 10),
+                       committer: "Sam", email: "z@example.com")
+        let b = branch("refs/heads/b", name: "Beta", date: a.committedAt,
+                       committer: "Sam", email: "a@example.com")
+        let c = branch("refs/heads/c", name: "Beta", date: a.committedAt,
+                       committer: "Sam", email: "a@example.com")
+        for inventory in [[c, b, a], [a, b, c]] {
+            session.reconcile(inventory)
+            for direction in [SortOrder.forward, .reverse] {
+                session.sortOrder = [.init(column: .branch, order: direction)]
+                #expect(session.rows.map(\.id) == (direction == .forward
+                    ? [a.reference, b.reference, c.reference] : [b.reference, c.reference, a.reference]))
+                session.sortOrder = [.init(column: .committer, order: direction)]
+                #expect(session.rows.map(\.id) == (direction == .forward
+                    ? [b.reference, c.reference, a.reference] : [a.reference, b.reference, c.reference]))
+                session.sortOrder = [.init(column: .date, order: direction)]
+                #expect(session.rows.map(\.id) == [a.reference, b.reference, c.reference])
+            }
+        }
+    }
+
+    @Test func committerOptionsUseFullInventoryAndCombineFilters() {
+        let session = BranchListState()
+        let a = branch("refs/heads/a", name: "Alpha", committer: "Sam", email: "a@example.com")
+        let b = branch("refs/heads/b", name: "Beta", committer: "Sam", email: "b@example.com")
+        let remote = branch("refs/remotes/origin/a", name: "Alpha", committer: "Sam",
+                            email: "a@example.com", remote: "origin")
+        session.reconcile([a, b, remote])
+        let identity = BranchRowPresentation(a).committer
+        #expect(session.committers.count == 2)
+        #expect(Set(session.committers.map(\.label)).count == 2)
+        session.selection = [a.reference, b.reference, remote.reference]
+        session.committer = identity
+        #expect(session.selection == [a.reference, remote.reference])
+        session.filter = .remote
+        session.query = "ALPHA"
+        #expect(session.rows.map(\.id) == [remote.reference])
+        #expect(session.selection == [remote.reference])
+        #expect(session.committers.count == 2)
+        session.query = "Beta"
+        #expect(session.rows.isEmpty)
+        #expect(session.selection.isEmpty)
+        #expect(session.committers.count == 2)
+    }
+
+    @Test func committerRefreshRetainsExistingIdentityAndResetsMissingIdentity() {
+        let session = BranchListState()
+        let a = branch("refs/heads/a", committer: "Sam", email: "a@example.com")
+        let b = branch("refs/heads/b", committer: "Sam", email: "b@example.com")
+        session.reconcile([a, b])
+        let identity = BranchRowPresentation(a).committer
+        session.committer = identity
+        session.selection = [a.reference]
+        session.reconcile([b, a, a])
+        #expect(session.committer == identity)
+        #expect(session.committers.count == 2)
+        #expect(session.selection == [a.reference])
+        session.invalidateInventory()
+        #expect(session.committer == identity)
+        session.reconcile([b])
+        #expect(session.committer == nil)
+        #expect(session.rows.map(\.id) == [b.reference])
+        session.committer = BranchRowPresentation(b).committer
+        session.removeConfirmedBranches(ids: [b.reference])
+        #expect(session.committer == nil)
+        #expect(session.committers.isEmpty)
+        #expect(session.rows.isEmpty)
     }
 
     @Test func gravatarUsesNormalizedSHA256AndRejectsEmptyEmail() {

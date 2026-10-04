@@ -9,35 +9,37 @@ struct BranchLifecycleCell: View {
     var error: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        HStack(spacing: 5) {
             Label(title, systemImage: symbol)
-                .foregroundStyle(lifecycle?.mergeState == .merged ? Color.green : Color.secondary)
+                .foregroundStyle(!isLoading && lifecycle?.mergeState == .merged ? Color.green : Color.secondary)
             if lifecycle?.upstreamGone == true {
-                Label("Upstream gone", systemImage: "arrow.up.right.circle")
-                    .font(.caption)
+                Image(systemName: "arrow.up.right.circle")
                     .foregroundStyle(.orange)
+                    .accessibilityLabel("Upstream gone")
             }
         }
+        .lineLimit(1)
         .help(help)
     }
 
     private var title: String {
-        guard let lifecycle else { return isLoading ? "Checking…" : "Unknown" }
+        if isLoading { return "Checking…" }
+        guard let lifecycle else { return "Unknown" }
         switch lifecycle.mergeState {
-        case .base: return "Comparison base"
+        case .base: return "Base"
         case .merged: return "Merged"
-        case .notMerged: return "Not merged"
+        case .notMerged: return "No"
         case .unknown: return "Unknown"
         }
     }
 
     private var symbol: String {
+        if isLoading { return "ellipsis" }
         switch lifecycle?.mergeState {
-        case .base: "flag"
-        case .merged: "checkmark.circle.fill"
-        case .notMerged: "circle"
-        case .unknown: "questionmark.circle"
-        case nil: isLoading ? "ellipsis" : "questionmark.circle"
+        case .base: return "flag"
+        case .merged: return "checkmark"
+        case .notMerged: return "minus"
+        case .unknown, nil: return "questionmark.circle"
         }
     }
 
@@ -49,6 +51,39 @@ struct BranchLifecycleCell: View {
         if let detail = lifecycle?.detail { text += "\n\(detail)" }
         if let error { text += "\n\(error)" }
         return text + "\nRemote information reflects the last fetch; Refresh does not fetch or prune."
+    }
+}
+
+/// The normal header shows one line; measurement details remain one click away.
+struct CompactProjectSizeView: View {
+    let session: ProjectSessionState
+    @State private var showingDetails = false
+
+    var body: some View {
+        Button { showingDetails.toggle() } label: {
+            HStack(spacing: 6) {
+                Text(session.sizePresentation.totalLabel)
+                    .fontWeight(.medium)
+                    .monospacedDigit()
+                Text("· \(session.rows.count) worktrees")
+                    .foregroundStyle(.secondary)
+                Image(systemName: "info.circle").foregroundStyle(.secondary)
+            }
+            .lineLimit(1)
+        }
+        .buttonStyle(.plain)
+        .help(session.sizePresentation.help)
+        .accessibilityLabel("Project disk usage: \(session.sizePresentation.totalLabel). Show details.")
+        .popover(isPresented: $showingDetails) {
+            VStack(alignment: .leading, spacing: 12) {
+                ProjectSizeView(summary: session.summary, presentation: session.sizePresentation)
+                Text(session.sizePresentation.help)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(16)
+            .frame(width: 360)
+        }
     }
 }
 

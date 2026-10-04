@@ -102,7 +102,6 @@ struct DeletionConfirmation: View {
             }
             HStack {
                 if store.isDeleting {
-                    ProgressView().controlSize(.small)
                     Text(store.progressText.isEmpty ? "Authenticating…" : store.progressText)
                         .font(.caption)
                         .lineLimit(1)

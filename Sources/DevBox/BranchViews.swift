@@ -6,20 +6,13 @@ struct BranchesView: View {
     let session: BranchListState
     @Environment(AppStore.self) private var store
     @AppStorage("devbox.gravatarEnabled") private var gravatarEnabled = false
+    @State private var showsOptions = false
 
     private var busy: Bool { store.isRefreshing || store.isDeleting || store.isModalPresented }
 
     var body: some View {
         @Bindable var session = session
         VStack(spacing: 0) {
-            DetailHeader(title: "Branches", subtitle: project.path, symbol: "arrow.triangle.branch") {
-                Button("Fetch & Prune", action: store.fetchBranches)
-                    .help("Contacts all remotes, fetches branches, and prunes obsolete remote tracking refs.")
-                    .disabled(busy)
-                Button("Refresh", action: store.refresh)
-                    .help("Rereads local branch and remote tracking refs. Does not contact the server.")
-                    .disabled(busy)
-            }
             controls
             if let error = store.loadError, session.rows.isEmpty {
                 LoadErrorView(message: error, retry: store.refresh)
@@ -29,14 +22,16 @@ struct BranchesView: View {
                         .font(.callout).foregroundStyle(.orange).help(error)
                         .padding(.vertical, 8)
                 }
-                Table(session.rows, selection: $session.selection) {
-                    TableColumn("Branch") { row in BranchNameCell(row: row) }
+                Table(session.rows, selection: $session.selection, sortOrder: $session.sortOrder) {
+                    TableColumn("Branch", sortUsing: BranchRowComparator(column: .branch)) { row in
+                        BranchNameCell(row: row)
+                    }
                         .width(min: 150, ideal: 230)
-                    TableColumn("Latest commit date") { row in
+                    TableColumn("Latest commit date", sortUsing: BranchRowComparator(column: .date)) { row in
                         Text(row.commitDate).help(row.commitHelp)
                     }
                     .width(min: 140, ideal: 175)
-                    TableColumn("Committer") { row in
+                    TableColumn("Committer", sortUsing: BranchRowComparator(column: .committer)) { row in
                         BranchCommitterCell(row: row, gravatarEnabled: gravatarEnabled)
                     }
                     .width(min: 150, ideal: 200)
@@ -79,28 +74,47 @@ struct BranchesView: View {
                     ForEach(BranchFilter.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .labelsHidden().frame(width: 100)
-                Picker("Sort", selection: $session.sort) {
-                    ForEach(BranchSort.allCases) { Text($0.rawValue).tag($0) }
+                Picker("Committer", selection: $session.committer) {
+                    Text("All committers").tag(nil as BranchCommitter?)
+                    ForEach(session.committers) { Text($0.label).tag(Optional($0)) }
                 }
-                .frame(width: 185)
+                .labelsHidden().frame(width: 185)
+                Button("Fetch & Prune", action: store.fetchBranches)
+                    .help("Contacts all remotes, fetches branches, and prunes obsolete remote tracking refs.")
+                    .disabled(busy)
+                Button {
+                    showsOptions.toggle()
+                } label: {
+                    Image(systemName: "info.circle")
+                }
+                .accessibilityLabel("Branch information and options")
+                .popover(isPresented: $showsOptions) { options }
             }
-            // Keep captions within the split view's proposed size. Vertical
-            // fixedSize here blanks the entire split view on macOS 26.6.2.
-            Text("Latest commit is a proxy for activity, not the last checkout or view. Committer is the commit identity, not the server pusher.")
-                .font(.caption).foregroundStyle(.secondary)
-            Text(session.fetchDescription)
-                .font(.caption).foregroundStyle(.secondary)
             if !session.hasLoadedInventory && !store.isRefreshing {
                 Label("Inventory needs verification. Refresh local refs, or Fetch & Prune to check remotes, before deleting.",
                       systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)
             }
-            Toggle("Load committer icons from Gravatar", isOn: $gravatarEnabled)
-                .toggleStyle(.checkbox).font(.caption)
-                .help("Loads icons from Gravatar using a hash of the commit email address.")
         }
-        .padding(.horizontal, 20).padding(.vertical, 10)
+        .padding(.horizontal, 12).padding(.vertical, 8)
         .layoutPriority(1)
+    }
+
+    private var options: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Branch information").font(.headline)
+            Text("Latest commit is a proxy for activity, not the last checkout or view. Committer is the commit identity, not the server pusher.")
+            Text(session.fetchDescription)
+            Text("Refresh rereads local refs without contacting the server. Fetch & Prune contacts all remotes and removes obsolete tracking refs.")
+            Divider()
+            Toggle("Load committer icons from Gravatar", isOn: $gravatarEnabled)
+                .toggleStyle(.checkbox)
+            Text("Off by default. Enabling sends a hash of each commit email to Gravatar to load icons.")
+                .foregroundStyle(.secondary)
+        }
+        .font(.callout)
+        .padding(16)
+        .frame(width: 360)
     }
 
     private func canDelete(_ ids: Set<String>) -> Bool {

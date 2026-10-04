@@ -327,7 +327,10 @@ final class AppStore {
 
     var selectedWorktrees: [WorktreeRow] {
         guard let session = selectedProjectSession else { return [] }
-        return worktreeSelection.sorted().compactMap { session.row(id: $0)?.row }
+        // A filter may change before SwiftUI reconciles its native selection.
+        // Never include hidden rows in a destructive action during that interval.
+        let visible = Set(session.tableRows.map(\.id))
+        return worktreeSelection.intersection(visible).sorted().compactMap { session.row(id: $0)?.row }
     }
     var selectedDatabases: [DatabaseRecord] { databases.filter { databaseSelection.contains($0.id) } }
 

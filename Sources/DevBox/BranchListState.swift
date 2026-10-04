@@ -8,9 +8,47 @@ enum BranchFilter: String, CaseIterable, Identifiable {
     var id: Self { self }
 }
 
-enum BranchSort: String, CaseIterable, Identifiable {
-    case newest = "Newest commit", oldest = "Oldest commit", name = "Name"
+struct BranchCommitter: Hashable, Identifiable {
+    let name: String
+    let email: String
     var id: Self { self }
+    var label: String {
+        let name = name.isEmpty ? "Unknown" : name
+        return email.isEmpty ? "\(name) (no email)" : "\(name) <\(email)>"
+    }
+}
+
+/// Compare whole rows so unknown dates stay last even when a table header reverses order.
+struct BranchRowComparator: SortComparator {
+    enum Column: Hashable { case branch, date, committer }
+    var column: Column
+    var order: SortOrder = .forward
+
+    func compare(_ lhs: BranchRowPresentation, _ rhs: BranchRowPresentation) -> ComparisonResult {
+        let result: ComparisonResult
+        switch column {
+        case .branch:
+            result = lhs.displayName.localizedStandardCompare(rhs.displayName)
+        case .committer:
+            let name = lhs.committer.name.localizedStandardCompare(rhs.committer.name)
+            result = name == .orderedSame
+                ? lhs.committer.email.localizedStandardCompare(rhs.committer.email) : name
+        case .date:
+            switch (lhs.branch.committedAt, rhs.branch.committedAt) {
+            case (nil, nil): return .orderedSame
+            case (nil, _): return .orderedDescending
+            case (_, nil): return .orderedAscending
+            case let (left?, right?):
+                result = left.compare(right)
+            }
+        }
+        guard order == .reverse else { return result }
+        switch result {
+        case .orderedAscending: return .orderedDescending
+        case .orderedDescending: return .orderedAscending
+        case .orderedSame: return .orderedSame
+        }
+    }
 }
 
 enum Gravatar {
@@ -30,6 +68,9 @@ struct BranchRowPresentation: Identifiable, Equatable {
     let commitDate: String
     let commitHelp: String
     let avatarURL: URL?
+    var committer: BranchCommitter {
+        BranchCommitter(name: branch.committerName, email: branch.committerEmail)
+    }
 
     init(_ branch: ManagedBranch) {
         self.branch = branch
@@ -56,8 +97,12 @@ final class BranchListState {
     var query = "" {
         didSet { if query != oldValue { updateRows() } }
     }
-    var sort: BranchSort = .newest {
-        didSet { if sort != oldValue { updateRows() } }
+    var sortOrder = [BranchRowComparator(column: .date, order: .reverse)] {
+        didSet { if sortOrder != oldValue { updateRows() } }
+    }
+    private(set) var committers: [BranchCommitter] = []
+    var committer: BranchCommitter? {
+        didSet { if committer != oldValue { updateRows() } }
     }
     var lastFetchedAt: Date? {
         didSet { updateFetchPresentation() }
@@ -77,6 +122,7 @@ final class BranchListState {
             return BranchRowPresentation(branch)
         }
         hasLoadedInventory = true
+        updateCommitters()
         updateRows()
     }
 
@@ -87,6 +133,7 @@ final class BranchListState {
 
     func removeConfirmedBranches(ids: Set<String>) {
         inventory.removeAll { ids.contains($0.id) }
+        updateCommitters()
         updateRows()
     }
 
@@ -104,6 +151,16 @@ final class BranchListState {
         }
     }
 
+    private func updateCommitters() {
+        // Options come from the full inventory, never from the filtered rows.
+        committers = Set(inventory.map(\.committer)).sorted {
+            let result = $0.label.localizedStandardCompare($1.label)
+            if result != .orderedSame { return result == .orderedAscending }
+            return ($0.name, $0.email) < ($1.name, $1.email)
+        }
+        if let committer, !committers.contains(committer) { self.committer = nil }
+    }
+
     private func updateRows() {
         let search = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let next = inventory.filter { row in
@@ -113,14 +170,13 @@ final class BranchListState {
                 row.displayName.localizedCaseInsensitiveContains(search) ||
                 branch.committerName.localizedCaseInsensitiveContains(search) ||
                 branch.committerEmail.localizedCaseInsensitiveContains(search)
-            return matchesFilter && matchesQuery
+            return matchesFilter && matchesQuery && (committer == nil || row.committer == committer)
         }.sorted { lhs, rhs in
-            if sort != .name, lhs.branch.committedAt != rhs.branch.committedAt {
-                // Unknown dates always follow known dates, in either direction.
-                guard let left = lhs.branch.committedAt else { return false }
-                guard let right = rhs.branch.committedAt else { return true }
-                return sort == .newest ? left > right : left < right
+            for comparator in sortOrder {
+                let result = comparator.compare(lhs, rhs)
+                if result != .orderedSame { return result == .orderedAscending }
             }
+            // Stable ascending ties, independent of inventory order or sort direction.
             let order = lhs.displayName.localizedStandardCompare(rhs.displayName)
             return order == .orderedSame ? lhs.id < rhs.id : order == .orderedAscending
         }

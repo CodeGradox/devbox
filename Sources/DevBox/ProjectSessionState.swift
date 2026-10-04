@@ -114,6 +114,16 @@ final class WorktreeState: Identifiable {
 final class ProjectSessionState {
     let branchList = BranchListState()
     private(set) var rows: [WorktreeState] = []
+    // Publish sort/filter values only when they change. Hosted cells continue
+    // observing their stable state references for measurement details and errors.
+    private(set) var tableRows: [WorktreeListRow] = []
+    private(set) var filterCounts = WorktreeFilterCounts()
+    var filter: WorktreeFilter = .all {
+        didSet { if filter != oldValue { refreshTableRows() } }
+    }
+    var sortOrder = [WorktreeSort(column: .name)] {
+        didSet { if sortOrder != oldValue { refreshTableRows() } }
+    }
     private(set) var overview = ProjectOverview()
     private(set) var summary = ProjectSizeSummary(rows: [WorktreeRow](), overview: ProjectOverview())
     private(set) var sizePresentation = ProjectSizePresentation(
@@ -126,6 +136,7 @@ final class ProjectSessionState {
     @ObservationIgnored private var byID: [String: WorktreeState] = [:]
     @ObservationIgnored private var batchDepth = 0
     @ObservationIgnored private var summaryDirty = false
+    @ObservationIgnored private var tableDirty = false
     @ObservationIgnored private let signposter = OSSignposter(subsystem: "app.devbox.DevBox", category: "Project state")
 
     var snapshots: [WorktreeRow] { rows.map(\.row) }
@@ -166,6 +177,7 @@ final class ProjectSessionState {
                 }
             } else {
                 state = WorktreeState(row: WorktreeRow(worktree: record))
+                state.updateBranches(overview)
             }
             next.append(state)
             lookup[record.id] = state
@@ -174,6 +186,7 @@ final class ProjectSessionState {
         if rows.map(\.id) != next.map(\.id) { rows = next }
         if !hasLoadedInventory { hasLoadedInventory = true }
         refreshSummary()
+        refreshTableRows()
     }
 
     func invalidateInventory() { hasLoadedInventory = false }
@@ -196,6 +209,7 @@ final class ProjectSessionState {
         // last-known values until Refresh. Recompute rather than blindly subtract:
         // missing/partial measurements and overflow must still be represented correctly.
         refreshSummary()
+        refreshTableRows()
     }
 
     func pauseScans() {
@@ -219,8 +233,10 @@ final class ProjectSessionState {
     func updateRow(_ id: String, _ mutation: (inout WorktreeRow) -> Void) {
         guard let state = byID[id] else { return }
         let before = state.row
+        let sortValues = WorktreeListRow(state)
         state.update(mutation)
         if !before.hasSameMeasurement(as: state.row) { refreshSummary() }
+        if WorktreeListRow(state) != sortValues { refreshTableRows() }
     }
 
     func updateOverview(_ mutation: (inout ProjectOverview) -> Void) {
@@ -233,6 +249,7 @@ final class ProjectSessionState {
             let next = BranchPickerPresentation(overview: overview, previous: branchPresentation)
             if branchPresentation != next { branchPresentation = next }
             for state in rows { state.updateBranches(overview) }
+            refreshTableRows()
         }
         if !before.hasSameMeasurement(as: overview) { refreshSummary() }
     }
@@ -245,6 +262,10 @@ final class ProjectSessionState {
                 summaryDirty = false
                 refreshSummary()
             }
+            if batchDepth == 0 && tableDirty {
+                tableDirty = false
+                refreshTableRows()
+            }
         }
         update()
     }
@@ -255,6 +276,21 @@ final class ProjectSessionState {
             state.refreshPresentation()
         }
         sizePresentation = ProjectSizePresentation(summary: summary, overview: overview)
+        refreshTableRows()
+    }
+
+    private func refreshTableRows() {
+        guard batchDepth == 0 else { tableDirty = true; return }
+        let counts = WorktreeFilterCounts(
+            all: rows.count,
+            changed: rows.filter { $0.matches(.changed) }.count,
+            merged: rows.filter { $0.matches(.merged) }.count
+        )
+        if counts != filterCounts { filterCounts = counts }
+        let next = rows.filter { $0.matches(filter) }.map(WorktreeListRow.init).sorted {
+            WorktreeSort.precedes($0, $1, using: sortOrder)
+        }
+        if tableRows != next { tableRows = next }
     }
 
     private func refreshSummary() {

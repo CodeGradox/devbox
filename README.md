@@ -12,15 +12,23 @@ Requires **macOS 26 or newer**.
 - Open a branch's worktree in your preferred editor without switching branches.
 - View worktree and project sizes without double-counting nested worktrees.
 - Refresh an individual worktree's size or refresh the whole project.
+- Filter worktrees to uncommitted or merged work, and click any column header to sort.
+- Review cleanup suggestions for merged worktrees. Clean worktrees and worktrees with
+  uncommitted changes are shown separately; deletion still requires confirmation.
+- Compact rows keep names, changes, merge status, and disk usage visible together.
+  Hover for full paths, Git status details, and file counts; click the project total for its breakdown.
 - Delete selected worktrees together, removing their folders and registrations while keeping their branches.
 
 ### Git branches
 
 - Select a project, then choose **Branches** to manage its local and remote-tracking branches.
-- Filter local or remote branches, search by branch or committer, and sort by name or latest commit date.
+- Filter local or remote branches and choose a committer from the loaded inventory. These
+  filters combine with search by branch name, committer name, or email without fetching.
+- Click **Branch**, **Latest commit date**, or **Committer** to sort; click again to reverse.
+  Unknown dates stay last in either direction.
 - See each branch's latest commit date and committer name/email. Git does not record a shared
   history of who last viewed or checked out a branch; these are commit details, not a usage audit.
-- Enable **Load committer icons from Gravatar** to request avatars using hashed commit emails.
+- In the branch information popover, enable **Load committer icons from Gravatar** to request avatars using hashed commit emails.
   Icons are off by default; unavailable avatars use a local placeholder.
 - Open branches on GitHub when a GitHub remote can be identified. Local branches need an
   existing configured upstream; unpublished branches do not get speculative links.

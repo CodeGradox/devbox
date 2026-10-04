@@ -102,7 +102,24 @@ struct BranchRenderingTests {
             let bitmap = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
             host.cacheDisplay(in: host.bounds, to: bitmap)
             #expect(bitmap.pixelsWide >= Int(width))
-            #expect(tables(in: host).contains { $0.numberOfRows == branches.count && $0.tableColumns.count == 4 })
+            let table = try #require(tables(in: host).first {
+                $0.numberOfRows == branches.count && $0.tableColumns.count == 4
+            })
+            let list = try #require(store.selectedProjectSession?.branchList)
+            for (index, column) in [
+                BranchRowComparator.Column.branch, .date, .committer
+            ].enumerated() {
+                let descriptor = try #require(table.tableColumns[index].sortDescriptorPrototype)
+                for direction in [SortOrder.forward, .reverse] {
+                    table.sortDescriptors = [direction == .forward
+                        ? descriptor : descriptor.reversedSortDescriptor as! NSSortDescriptor]
+                    try await Task.sleep(for: .milliseconds(50))
+                    #expect(list.sortOrder.first?.column == column)
+                    #expect(list.sortOrder.first?.order == direction)
+                    #expect(table.numberOfRows == branches.count)
+                }
+            }
+            #expect(table.tableColumns[3].sortDescriptorPrototype == nil)
             // Native table membership and cacheDisplay can pass while SwiftUI's
             // on-screen content is completely blank. Opt in on a GUI session:
             // DEVBOX_UI_TESTS=1 swift test --filter BranchRenderingTests
@@ -113,7 +130,7 @@ struct BranchRenderingTests {
                 request.recognitionLanguages = ["en-US"]
                 try VNImageRequestHandler(cgImage: image).perform([request])
                 let text = request.results?.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n") ?? ""
-                for label in ["Projects", "Branches", "Latest commit", "Taylor", "Gravatar"] {
+                for label in ["Projects", "Branches", "Latest commit", "Taylor", "Fetch & Prune"] {
                     #expect(text.contains(label), "Visible window is missing \(label) at width \(width). OCR: \(text)")
                 }
                 if let path = ProcessInfo.processInfo.environment["DEVBOX_BRANCH_SCREENSHOT"] {
