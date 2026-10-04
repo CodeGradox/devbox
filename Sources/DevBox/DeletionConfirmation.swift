@@ -4,6 +4,7 @@ struct DeletionConfirmation: View {
     @Environment(AppStore.self) private var store
     @Environment(\.dismiss) private var dismiss
     @State private var acknowledged = false
+    @State private var forceBranches = false
     let request: DeletionRequest
 
     var body: some View {
@@ -37,6 +38,18 @@ struct DeletionConfirmation: View {
                             )
                             if row.id != rows.last?.id { Divider() }
                         }
+                    case .branches(_, let branches):
+                        ForEach(branches) { branch in
+                            let entry = store.deletionEntry(for: branch.reference, in: request)
+                            DeletionItemView(
+                                name: branch.name,
+                                subtitle: branch.isRemote
+                                    ? "Delete from remote \(branch.remoteName ?? "unknown") · \(branch.reference)"
+                                    : "Local branch · \(branch.reference)",
+                                state: entry.state, startedAt: entry.startedAt, elapsed: entry.elapsed
+                            )
+                            if branch.id != branches.last?.id { Divider() }
+                        }
                     case .databases(_, let databases):
                         ForEach(databases) { database in
                             let entry = store.deletionEntry(for: database.name, in: request)
@@ -61,6 +74,20 @@ struct DeletionConfirmation: View {
                 Toggle("Delete all contents, including uncommitted changes and ignored files", isOn: $acknowledged)
                     .toggleStyle(.checkbox)
                     .disabled(store.isDeleting)
+            } else if case .branches(_, let branches) = request.items {
+                if branches.contains(where: \.isRemote) {
+                    Toggle("Delete these branches from the remote server for everyone", isOn: $acknowledged)
+                        .toggleStyle(.checkbox)
+                        .disabled(store.isDeleting)
+                }
+                if branches.contains(where: { !$0.isRemote }) {
+                    Toggle("Force delete local branches even if Git considers them unmerged", isOn: $forceBranches)
+                        .toggleStyle(.checkbox)
+                        .disabled(store.isDeleting)
+                    Text("Off by default. Forcing deletion can make unmerged commits unreachable.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Label(
                 store.isDeleting
@@ -86,7 +113,7 @@ struct DeletionConfirmation: View {
                     .keyboardShortcut(.cancelAction)
                     .disabled(store.isDeleting)
                 Button("Authenticate & Delete…", role: .destructive) {
-                    Task { await store.delete(request) }
+                    Task { await store.delete(request, forceBranches: forceBranches) }
                 }
                 .disabled(store.isDeleting || needsAcknowledgment)
             }
@@ -107,19 +134,23 @@ struct DeletionConfirmation: View {
 
     private var needsAcknowledgment: Bool {
         if case .worktrees = request.items { return !acknowledged }
+        if case .branches(_, let branches) = request.items, branches.contains(where: \.isRemote) {
+            return !acknowledged
+        }
         return false
     }
 
     private var title: String {
         switch request.items {
         case .worktrees: "Delete \(request.count) Worktree\(request.count == 1 ? "" : "s")?"
+        case .branches: "Delete \(request.count) Branch\(request.count == 1 ? "" : "es")?"
         case .databases: "Delete \(request.count) Database\(request.count == 1 ? "" : "s")?"
         }
     }
 
     private var scope: String {
         switch request.items {
-        case .worktrees(let project, _): project.name
+        case .worktrees(let project, _), .branches(let project, _): project.name
         case .databases(let connection, _):
             "\(connection.name) · \(connection.settings.socketPath.isEmpty ? "\(connection.settings.host):\(connection.settings.port)" : connection.settings.socketPath)"
         }
@@ -129,6 +160,8 @@ struct DeletionConfirmation: View {
         switch request.items {
         case .worktrees:
             "The selected folders and their Git worktree registrations will be permanently removed. Branches will be kept. This cannot be undone."
+        case .branches:
+            "Local branches are removed only from this repository. Remote branches are deleted from the server for all collaborators, not just hidden locally. Worktree folders are not removed. No backup will be made."
         case .databases:
             "All tables and data in the selected databases will be permanently deleted. No backup will be made. This cannot be undone."
         }

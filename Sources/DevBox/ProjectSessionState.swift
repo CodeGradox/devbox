@@ -112,6 +112,7 @@ final class WorktreeState: Identifiable {
 /// identity, not duplicate arrays that copy-on-write on every result.
 @MainActor @Observable
 final class ProjectSessionState {
+    let branchList = BranchListState()
     private(set) var rows: [WorktreeState] = []
     private(set) var overview = ProjectOverview()
     private(set) var summary = ProjectSizeSummary(rows: [WorktreeRow](), overview: ProjectOverview())

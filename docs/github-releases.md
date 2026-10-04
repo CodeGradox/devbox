@@ -8,6 +8,21 @@ The workflows use native `macos-26` (Apple Silicon/arm64) and
 They check the selected toolchain rather than silently accepting an older SDK.
 These are separate native downloads, not universal binaries.
 
+## Local visible-window check
+
+On a logged-in macOS desktop, run:
+
+```sh
+DEVBOX_UI_TESTS=1 swift test --filter BranchRenderingTests
+```
+
+This additionally captures only the test's own windows and verifies visible
+sidebar, controls, and branch-row text at minimum and default window widths.
+It needs no Screen Recording permission and captures no other applications.
+Ordinary bitmap/layout tests alone cannot detect a blank SwiftUI window.
+Optionally set `DEVBOX_BRANCH_SCREENSHOT=/path/to/branches.png` to save the
+captures as `branches.900.png` and `branches.1140.png`.
+
 ## Ordinary CI: no credentials
 
 `build.yml` runs for pull requests, pushes to `main`, `v*` tags, and manual

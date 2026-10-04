@@ -8,6 +8,13 @@ enum Destination: Hashable {
     case connection(UUID)
 }
 
+enum ProjectSection: String, CaseIterable, Identifiable {
+    case worktrees = "Worktrees"
+    case branches = "Branches"
+
+    var id: Self { self }
+}
+
 enum SizeScanState {
     case idle
     case queued
@@ -67,6 +74,7 @@ struct WorktreeRow: Identifiable {
 struct DeletionRequest: Identifiable {
     enum Items {
         case worktrees(ProjectRecord, [WorktreeRow])
+        case branches(ProjectRecord, [ManagedBranch])
         case databases(SavedConnection, [DatabaseRecord])
     }
     let id = UUID()
@@ -75,6 +83,7 @@ struct DeletionRequest: Identifiable {
     var count: Int {
         switch items {
         case .worktrees(_, let rows): rows.count
+        case .branches(_, let rows): rows.count
         case .databases(_, let rows): rows.count
         }
     }
@@ -82,6 +91,7 @@ struct DeletionRequest: Identifiable {
     var entries: [OperationResult.Entry] {
         switch items {
         case .worktrees(_, let rows): rows.map { .init(name: $0.worktree.path) }
+        case .branches(_, let rows): rows.map { .init(name: $0.reference) }
         case .databases(_, let rows): rows.map { .init(name: $0.name) }
         }
     }
@@ -148,7 +158,16 @@ final class AppStore {
         didSet {
             guard destination != oldValue else { return }
             worktreeSelection = []
+            selectedProjectSession?.branchList.selection = []
             databaseSelection = []
+            loadSelection()
+        }
+    }
+    var projectSection: ProjectSection = .worktrees {
+        didSet {
+            guard projectSection != oldValue else { return }
+            worktreeSelection = []
+            selectedProjectSession?.branchList.selection = []
             loadSelection()
         }
     }
@@ -188,6 +207,9 @@ final class AppStore {
     private let openWorktreeInEditor: @MainActor (String, EditorApplication) async throws -> Void
     private let sizeQueue: WorktreeSizeQueue
     private let inspectBranches: @Sendable (ProjectRecord, [WorktreeRecord]) async throws -> BranchInspection
+    private let listManagedBranches: @Sendable (ProjectRecord) async throws -> [ManagedBranch]
+    private let fetchManagedBranches: @Sendable (ProjectRecord) async throws -> Void
+    private let deleteBranch: @Sendable (ManagedBranch, ProjectRecord, Bool) async throws -> Void
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
     @ObservationIgnored private var branchTask: Task<Void, Never>?
     @ObservationIgnored private var generation = UUID()
@@ -228,6 +250,15 @@ final class AppStore {
         inspectBranches: @escaping @Sendable (ProjectRecord, [WorktreeRecord]) async throws -> BranchInspection = {
             try await BranchStatusService().inspect(project: $0, worktrees: $1)
         },
+        listManagedBranches: @escaping @Sendable (ProjectRecord) async throws -> [ManagedBranch] = {
+            try await BranchManagementService().list(project: $0)
+        },
+        fetchManagedBranches: @escaping @Sendable (ProjectRecord) async throws -> Void = {
+            try await BranchManagementService().fetch(project: $0)
+        },
+        deleteBranch: @escaping @Sendable (ManagedBranch, ProjectRecord, Bool) async throws -> Void = {
+            try await BranchManagementService().delete(branch: $0, project: $1, force: $2)
+        },
         dropDatabase: @escaping @Sendable (DatabaseRecord, ConnectionSettings, String) async throws -> Void = {
             try await DatabaseService().dropDatabase($0, settings: $1, password: $2)
         },
@@ -251,6 +282,9 @@ final class AppStore {
         self.credentials = credentials
         self.sizeQueue = sizeQueue
         self.inspectBranches = inspectBranches
+        self.listManagedBranches = listManagedBranches
+        self.fetchManagedBranches = fetchManagedBranches
+        self.deleteBranch = deleteBranch
         self.dropDatabase = dropDatabase
         self.removeWorktree = removeWorktree
         self.listDatabases = listDatabases
@@ -296,6 +330,10 @@ final class AppStore {
         return worktreeSelection.sorted().compactMap { session.row(id: $0)?.row }
     }
     var selectedDatabases: [DatabaseRecord] { databases.filter { databaseSelection.contains($0.id) } }
+
+    var selectedBranches: [ManagedBranch] {
+        selectedProjectSession?.branchList.selectedBranches ?? []
+    }
 
     var openInEditorTitle: String {
         preferredEditor.map { "Open in \($0.name)" } ?? "Open in Editor…"
@@ -362,7 +400,7 @@ final class AppStore {
     }
 
     private func worktreeToOpenInEditor(_ ids: Set<String>) -> WorktreeRecord? {
-        guard !isDeleting, !isModalPresented, ids.count == 1,
+        guard projectSection == .worktrees, !isDeleting, !isModalPresented, ids.count == 1,
               let id = ids.first, let worktree = selectedProjectSession?.row(id: id)?.row.worktree,
               worktree.exists, !worktree.isBare else { return nil }
         return worktree
@@ -381,7 +419,10 @@ final class AppStore {
     }
 
     func refreshPresentations() {
-        for session in projectSessions.values { session.refreshPresentation() }
+        for session in projectSessions.values {
+            session.refreshPresentation()
+            session.branchList.refreshPresentation()
+        }
         for session in databaseSessions.values { session.refreshPresentation() }
     }
 
@@ -396,6 +437,10 @@ final class AppStore {
     var canDeleteSelection: Bool {
         guard !isRefreshing, !isDeleting, !isModalPresented else { return false }
         if selectedProject != nil {
+            if projectSection == .branches {
+                guard selectedProjectSession?.branchList.hasLoadedInventory == true else { return false }
+                return !selectedBranches.isEmpty && selectedBranches.allSatisfy { $0.protectedReason == nil }
+            }
             let selection = selectedWorktrees
             return !selection.isEmpty && selection.allSatisfy { $0.protectedReason == nil }
         }
@@ -521,6 +566,13 @@ final class AppStore {
         refresh(useCache: false)
     }
 
+    /// Network access is explicit; ordinary Refresh only rereads local refs.
+    func fetchBranches() {
+        guard selectedProject != nil, projectSection == .branches,
+              !isRefreshing, !isDeleting, !isModalPresented else { return }
+        refresh(useCache: false, fetchRemotes: true)
+    }
+
     func changeMergeTarget(_ reference: String?) {
         guard !isDeleting, !isModalPresented, let project = selectedProject,
               reference != project.mergeTarget else { return }
@@ -539,11 +591,12 @@ final class AppStore {
                 $0.branchError = nil
                 $0.isLoadingBranches = true
             }
+            projectSessions[project.id]?.branchList.invalidateInventory()
             loadSelection()
         } catch { errorMessage = error.localizedDescription }
     }
 
-    private func refresh(useCache: Bool) {
+    private func refresh(useCache: Bool, fetchRemotes: Bool = false) {
         guard !isDeleting else { return }
         refreshTask?.cancel()
         branchTask?.cancel()
@@ -562,6 +615,10 @@ final class AppStore {
         if selectedDatabaseSession !== databaseSession { selectedDatabaseSession = databaseSession }
         guard destination != nil else {
             isRefreshing = false
+            return
+        }
+        if let project, let session, projectSection == .branches {
+            loadBranchList(project, session: session, useCache: useCache, fetchRemotes: fetchRemotes, token: token)
             return
         }
         if useCache, let connection, let databaseSession, databaseSession.hasLoadedInventory {
@@ -622,6 +679,7 @@ final class AppStore {
                     guard generation == token, !Task.isCancelled else { return }
                     session.performBatchUpdates {
                         session.reconcile(records, refresh: true)
+                        session.branchList.invalidateInventory()
                         // Reset load state but retain last successful measurements
                         // until replaced. Rows remain displayed during refresh.
                         session.updateOverview {
@@ -656,6 +714,39 @@ final class AppStore {
                 databaseSession?.failStatistics(
                     "The database list could not be refreshed. \(error.localizedDescription)"
                 )
+            }
+        }
+    }
+
+    private func loadBranchList(
+        _ project: ProjectRecord, session: ProjectSessionState, useCache: Bool, fetchRemotes: Bool, token: UUID
+    ) {
+        let list = session.branchList
+        if useCache && list.hasLoadedInventory {
+            isRefreshing = false
+            refreshTask = nil
+            return
+        }
+        list.invalidateInventory()
+        isRefreshing = true
+        progressText = fetchRemotes ? "Fetching and pruning remote branches…" : "Loading branches…"
+        refreshTask = Task {
+            defer { finishRefresh(token: token) }
+            guard generation == token, !Task.isCancelled else { return }
+            do {
+                if fetchRemotes {
+                    // Even a failed fetch may update some refs. Don't reuse merge badges.
+                    session.updateOverview { $0.branches = nil; $0.branchError = nil }
+                    try await fetchManagedBranches(project)
+                    guard generation == token, !Task.isCancelled else { return }
+                    list.lastFetchedAt = Date()
+                }
+                let records = try await listManagedBranches(project)
+                guard generation == token, !Task.isCancelled else { return }
+                list.reconcile(records)
+            } catch {
+                guard generation == token, !Task.isCancelled else { return }
+                loadError = error.localizedDescription
             }
         }
     }
@@ -802,6 +893,10 @@ final class AppStore {
         guard canDeleteSelection else { return }
         deletionError = nil
         if let project = selectedProject {
+            if projectSection == .branches {
+                deletionRequest = DeletionRequest(items: .branches(project, selectedBranches))
+                return
+            }
             // Do not keep traversing folders the user is about to remove.
             let ids = Set(selectedWorktrees.map(\.id))
             sizeQueue.cancel(worktreeIDs: ids)
@@ -824,7 +919,7 @@ final class AppStore {
         return deletionEntries.first { $0.name == name } ?? .init(name: name)
     }
 
-    func delete(_ request: DeletionRequest) async {
+    func delete(_ request: DeletionRequest, forceBranches: Bool = false) async {
         guard !isDeleting, deletionRequest?.id == request.id else { return }
         isDeleting = true
         deletionError = nil
@@ -845,6 +940,10 @@ final class AppStore {
             await runDeletionBatch { index in
                 try await removeWorktree(rows[index].worktree, project)
             }
+        case .branches(let project, let rows):
+            await runDeletionBatch { index in
+                try await deleteBranch(rows[index], project, forceBranches && !rows[index].isRemote)
+            }
         case .databases(let connection, let rows):
             do {
                 let password = try password(for: connection.id)
@@ -862,11 +961,24 @@ final class AppStore {
         case .worktrees(let project, _):
             sizeQueue.cancel(worktreeIDs: completed)
             projectSessions[project.id]?.removeConfirmedWorktrees(ids: completed)
+            if !completed.isEmpty { projectSessions[project.id]?.branchList.invalidateInventory() }
+        case .branches(let project, _):
+            let session = projectSessions[project.id]
+            session?.branchList.removeConfirmedBranches(ids: completed)
+            if deletionEntries.contains(where: {
+                if case .uncertain = $0.state { return true }
+                return false
+            }) {
+                session?.branchList.invalidateInventory()
+            }
+            // Recompute upstream/merge information when returning to Worktrees.
+            session?.updateOverview { $0.branches = nil; $0.branchError = nil }
         case .databases(let connection, _):
             databaseSessions[connection.id]?.removeConfirmedDatabases(ids: completed)
         }
         progressText = ""
         worktreeSelection = []
+        selectedProjectSession?.branchList.selection = []
         databaseSelection = []
         queuedSheet = .results(.init(title: "Deletion Results", entries: deletionEntries))
         deletionRequest = nil
@@ -888,6 +1000,16 @@ final class AppStore {
             do {
                 try await operation(index)
                 deletionEntries[index].state = .completed
+            } catch BranchManagementError.deletionOutcomeUnknown(let message) {
+                deletionEntries[index].state = .uncertain(
+                    BranchManagementError.deletionOutcomeUnknown(message).localizedDescription
+                )
+                for remaining in deletionEntries.indices where remaining > index {
+                    deletionEntries[remaining].state = .notAttempted(
+                        "The batch stopped because the previous remote deletion's outcome is uncertain. Fetch & Prune before trying again."
+                    )
+                }
+                return
             } catch DatabaseServiceError.deletionOutcomeUnknown(let code) {
                 deletionEntries[index].state = .uncertain(
                     DatabaseServiceError.deletionOutcomeUnknown(code: code).localizedDescription

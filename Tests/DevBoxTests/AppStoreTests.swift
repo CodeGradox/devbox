@@ -261,6 +261,17 @@ func openInEditorUsesRequestedWorktreeWithoutChangingSelectionOrBranches() async
     #expect(store.errorMessage == nil)
     #expect(persistence.writes == 0)
     #expect(try await GitService().listWorktrees(project: project) == before)
+
+    store.projectSection = .branches
+    await waitForGitStatus(store)
+    #expect(store.worktreeSelection.isEmpty)
+    #expect(!store.canOpenInEditor([linked.id]))
+    await store.openInEditor([linked.id])
+    #expect(openedPaths == [linked.worktree.path, main.worktree.path])
+
+    store.projectSection = .worktrees
+    await waitForGitStatus(store)
+    #expect(store.canOpenInEditor([linked.id]))
 }
 
 @Test(.timeLimit(.minutes(1))) @MainActor

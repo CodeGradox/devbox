@@ -1,6 +1,6 @@
 # DevBox
 
-A native macOS app for managing Git worktrees and local MariaDB databases.
+A native macOS app for managing Git worktrees, branches, and local MariaDB databases.
 Requires **macOS 26 or newer**.
 
 ## Features
@@ -14,6 +14,26 @@ Requires **macOS 26 or newer**.
 - Refresh an individual worktree's size or refresh the whole project.
 - Delete selected worktrees together, removing their folders and registrations while keeping their branches.
 
+### Git branches
+
+- Select a project, then choose **Branches** to manage its local and remote-tracking branches.
+- Filter local or remote branches, search by branch or committer, and sort by name or latest commit date.
+- See each branch's latest commit date and committer name/email. Git does not record a shared
+  history of who last viewed or checked out a branch; these are commit details, not a usage audit.
+- Enable **Load committer icons from Gravatar** to request avatars using hashed commit emails.
+  Icons are off by default; unavailable avatars use a local placeholder.
+- Open branches on GitHub when a GitHub remote can be identified. Local branches need an
+  existing configured upstream; unpublished branches do not get speculative links.
+- **Refresh** rereads local refs. **Fetch & Prune** explicitly contacts the configured remotes
+  to update remote-tracking refs and remove stale ones.
+- Delete selected local branches, or delete branches from their remote server after explicit
+  confirmation. Remote deletion affects all collaborators; it does not just hide a local row.
+
+Checked-out branches, default branches, and unsafe or ambiguous remote configurations are
+protected. Local deletion refuses unmerged branches unless **Force delete** is explicitly
+enabled. Remote deletion checks the captured commit so it cannot remove a branch that has
+advanced since the last fetch. Server permissions and branch protections still apply.
+
 ### MariaDB
 
 - Connect to local MariaDB servers over TCP or a Unix socket.
@@ -24,6 +44,7 @@ Requires **macOS 26 or newer**.
 
 Results are cached while the app is open. Deletion updates the cache without
 rescanning everything else; use **Refresh** (`⌘R`) when you want fresh values.
+For fresh remote branch information, use **Fetch & Prune**.
 Light, dark, and system appearance are supported.
 
 **Deletion is permanent** and requires Touch ID or your Mac login password.

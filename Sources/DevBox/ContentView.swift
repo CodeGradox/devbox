@@ -16,7 +16,7 @@ struct ContentView: View {
         } detail: {
             VStack(spacing: 0) {
                 if let project = store.selectedProject, let session = store.selectedProjectSession {
-                    WorktreesView(project: project, session: session)
+                    ProjectView(project: project, session: session)
                 } else if let connection = store.selectedConnection, let session = store.selectedDatabaseSession {
                     DatabasesView(connection: connection, session: session)
                 } else {
@@ -57,7 +57,7 @@ private struct WorkspaceToolbar: ToolbarContent {
     var body: some ToolbarContent {
         if store.destination != nil {
             ToolbarItemGroup {
-                if store.selectedProject != nil {
+                if store.selectedProject != nil && store.projectSection == .worktrees {
                     Button { [ids = store.worktreeSelection] in
                         Task { await store.openInEditor(ids) }
                     } label: {
@@ -72,7 +72,9 @@ private struct WorkspaceToolbar: ToolbarContent {
                 } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
-                .help("Refresh status, sizes, and database statistics (⌘R)")
+                .help(store.selectedProject != nil && store.projectSection == .branches
+                      ? "Refresh local branch information without contacting remotes (⌘R)"
+                      : "Refresh status, sizes, and database statistics (⌘R)")
                 .disabled(store.isRefreshing || store.isDeleting)
                 Button(role: .destructive) {
                     store.prepareDeletion()
@@ -192,12 +194,43 @@ private struct WelcomeView: View {
         ContentUnavailableView {
             Label("Your Local Workspace", systemImage: "square.stack.3d.up")
         } description: {
-            Text("Manage Git worktrees and local MariaDB databases.\nAdd a project or connection to get started.")
+            Text("Manage Git worktrees, branches, and local MariaDB databases.\nAdd a project or connection to get started.")
         } actions: {
             HStack {
                 Button("Add Project…", action: store.addProject)
                     .buttonStyle(.borderedProminent)
                 Button("Connect to MariaDB…") { store.connectionEditor = .init() }
+            }
+        }
+    }
+}
+
+private struct ProjectView: View {
+    @Environment(AppStore.self) private var store
+    let project: ProjectRecord
+    let session: ProjectSessionState
+
+    var body: some View {
+        @Bindable var store = store
+        VStack(spacing: 0) {
+            HStack {
+                Picker("Repository view", selection: $store.projectSection) {
+                    ForEach(ProjectSection.allCases) { section in
+                        Text(section.rawValue).tag(section)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 260)
+                .disabled(store.isDeleting || store.isModalPresented)
+                Spacer()
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 12)
+            switch store.projectSection {
+            case .worktrees:
+                WorktreesView(project: project, session: session)
+            case .branches:
+                BranchesView(project: project, session: session.branchList)
             }
         }
     }
