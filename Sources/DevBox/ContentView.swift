@@ -297,19 +297,15 @@ private struct MergeTargetPicker: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Picker("Merge target", selection: Binding<String?>(
-                    get: { store.selectedProject?.mergeTarget },
-                    set: { store.changeMergeTarget($0) }
-                )) {
-                    Text("Main checkout (default)").tag(String?.none)
-                    ForEach(session.branchPresentation.options) { target in
-                        Text(target.label)
-                            .tag(Optional(target.reference))
-                    }
-                    if let saved = store.selectedProject?.mergeTarget,
-                       !session.branchPresentation.references.contains(saved) {
-                        Text(saved).tag(Optional(saved))
-                    }
+                HStack(spacing: 8) {
+                    Text("Merge target").accessibilityHidden(true)
+                    BranchTargetPopUpButton(
+                        options: session.branchPresentation.options,
+                        selection: Binding<String?>(
+                            get: { store.selectedProject?.mergeTarget },
+                            set: { store.changeMergeTarget($0) }
+                        )
+                    )
                 }
                 .frame(maxWidth: 300)
                 .disabled(store.isDeleting || store.isModalPresented || session.branchPresentation.isLoading)
