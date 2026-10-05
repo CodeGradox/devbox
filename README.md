@@ -63,29 +63,28 @@ guarantee of how much disk space deletion will reclaim.
 
 Get the app from the [latest release](https://github.com/CodeGradox/devbox/releases/latest):
 
-- [Apple Silicon (M1 and newer)](https://github.com/CodeGradox/devbox/releases/latest/download/DevBox-macos26-arm64-adhoc-non-notarized-app.zip)
+- [DevBox-macos-arm64.dmg — Apple Silicon (M1 and newer)](https://github.com/CodeGradox/devbox/releases/latest/download/DevBox-macos-arm64.dmg)
 
 Releases from v0.3.1 onward are Apple Silicon-only. The last Intel build remains
 available in [v0.3.0](https://github.com/CodeGradox/devbox/releases/tag/v0.3.0).
 
-Unzip the download and move **DevBox.app** into **Applications**.
-If the repository is private, you need GitHub access to download it.
+### Install
 
-### Opening it for the first time
+1. Open **DevBox-macos-arm64.dmg**.
+2. Drag **DevBox.app** onto the **Applications** shortcut.
+3. Eject the DevBox disk image and open DevBox from **Applications**.
 
-The downloads are **ad-hoc signed, not Apple-notarized**. macOS may show:
+Releases starting with **v0.3.2** use **Developer ID signing and Apple notarization**
+for both the app and disk image. The normal downloaded-app confirmation may
+appear; **Open Anyway** should not be needed for these releases.
 
-> Apple could not verify “DevBox.app” is free of malware…
+The optional `SHA256SUMS.txt` release asset is for verifying the download, not
+installation. A GitHub Release downloads the DMG directly. Downloads from
+**Actions → Artifacts** have an extra GitHub ZIP wrapper; unpack it to find the DMG.
 
-For a build you trust from this repository:
-
-1. Click **Done** in that popup—not **Move to Bin**.
-2. Open **System Settings → Privacy & Security**.
-3. Scroll down to **Security** and find the message that DevBox was blocked.
-4. Click **Open Anyway**, confirm, and authenticate if asked.
-
-**Open Anyway is in System Settings, not in the warning popup.** This approves
-the app locally without disabling Gatekeeper. A new build may need approval again.
+Older releases through **v0.3.1** and ordinary CI artifacts are still ad-hoc signed,
+not notarized. Prefer a new signed release rather than disabling Gatekeeper.
+Switching from an older build may prompt again for Keychain access.
 
 ## Getting started
 

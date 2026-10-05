@@ -70,14 +70,24 @@ security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
 # codesign needs the identity's keychain on the user search list even when an
 # explicit --keychain limits certificate selection. Keep existing chain sources.
 set_keychain_search_list "$DEVBOX_SIGNING_KEYCHAIN"
+# The credential directory and imported files are already private (0700/0600).
+# Public app/image contents must remain readable when installed by another user.
+umask 022
 CONFIGURATION=release sh scripts/build-app.sh
 app="$BUILD_DIR/DevBox.app"
 codesign --verify --deep --strict --verbose=2 "$app"
 codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'Authority=Developer ID Application:'
 codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'runtime'
 codesign -dv --verbose=4 "$app" 2>&1 | grep -F 'Timestamp='
-ditto -c -k --sequesterRsrc --keepParent "$app" "$credentials/submission.zip"
-xcrun notarytool submit "$credentials/submission.zip" \
+# Submit the final distribution once; Apple also checks the signed app inside.
+dmg="$BUILD_DIR/DevBox.dmg"
+sh scripts/build-dmg.sh "$app" "$dmg"
+codesign --force --sign "$DEVBOX_SIGNING_IDENTITY" --keychain "$DEVBOX_SIGNING_KEYCHAIN" \
+    --timestamp "$dmg"
+codesign --verify --strict --verbose=2 "$dmg"
+codesign -dv --verbose=4 "$dmg" 2>&1 | grep -F 'Authority=Developer ID Application:'
+codesign -dv --verbose=4 "$dmg" 2>&1 | grep -F 'Timestamp='
+xcrun notarytool submit "$dmg" \
     --key "$credentials/notary.p8" --key-id "$DEVBOX_NOTARY_KEY_ID" \
     --issuer "$DEVBOX_NOTARY_ISSUER_ID" --wait --output-format json > "$credentials/result.json"
 python3 - "$credentials/result.json" <<'PY'
@@ -87,6 +97,6 @@ print("Notarization:", result.get("id"), result.get("status"))
 if result.get("status") != "Accepted":
     raise SystemExit("Apple did not accept this submission; no release artifact will be uploaded.")
 PY
-xcrun stapler staple "$app"
-xcrun stapler validate "$app"
-spctl --assess --type execute --verbose=2 "$app"
+xcrun stapler staple "$dmg"
+xcrun stapler validate "$dmg"
+spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"

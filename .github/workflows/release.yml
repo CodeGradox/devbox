@@ -1,8 +1,14 @@
-name: Manual Developer ID notarized apps
-run-name: Notarized arm64 app from trusted main
+name: Release DevBox
+run-name: "${{ inputs.publish && 'Publish' || 'Build' }} signed DevBox for macOS"
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the signed DMG as a GitHub Release for the app version
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -17,6 +23,8 @@ jobs:
     timeout-minutes: 60
     env:
       ARCH: arm64
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Isolate build outputs
         run: |
@@ -25,6 +33,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Read release version from the app
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os, plistlib, re
+          with open("Resources/Info.plist", "rb") as source:
+              version = plistlib.load(source)["CFBundleShortVersionString"]
+          assert re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version), "Expected a stable semantic version"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+          PY
       - name: Check native toolchain and test before importing secrets
         run: |
           test "$(uname -m)" = "$ARCH"
@@ -40,7 +59,11 @@ jobs:
           PY
           unset DEVBOX_TEST_MARIADB_SOCKET
           sh scripts/test.sh
-      - name: Import ephemeral identity, sign, notarize and staple
+      - name: Prepare pinned disk image tools before importing secrets
+        run: |
+          sh scripts/prepare-dmg-tools.sh
+          sh scripts/test-dmg.sh
+      - name: Import ephemeral identity, sign and notarize app and disk image
         env:
           DEVBOX_CERTIFICATE_BASE64: ${{ secrets.DEVBOX_CERTIFICATE_BASE64 }}
           DEVBOX_CERTIFICATE_PASSWORD: ${{ secrets.DEVBOX_CERTIFICATE_PASSWORD }}
@@ -49,10 +72,11 @@ jobs:
           DEVBOX_NOTARY_KEY_ID: ${{ secrets.DEVBOX_NOTARY_KEY_ID }}
           DEVBOX_NOTARY_ISSUER_ID: ${{ secrets.DEVBOX_NOTARY_ISSUER_ID }}
         run: sh scripts/notarize-app.sh
-      - name: Verify and package stapled app
+      - name: Verify and collect stapled disk image
         run: |
           app="$BUILD_DIR/DevBox.app"
           binary="$app/Contents/MacOS/DevBox"
+          dmg="$BUILD_DIR/DevBox.dmg"
           test "$(lipo -archs "$binary")" = "$ARCH"
           test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 26.0
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")" = DevBox
@@ -60,10 +84,12 @@ jobs:
           xcrun vtool -show-build "$binary"
           xcrun vtool -show-build "$binary" | grep -Eq 'minos[[:space:]]+26\.0([[:space:]]|$)'
           codesign --verify --deep --strict --verbose=2 "$app"
-          xcrun stapler validate "$app"
+          hdiutil verify "$dmg"
+          codesign --verify --strict --verbose=2 "$dmg"
+          xcrun stapler validate "$dmg"
           mkdir -p artifacts
-          ditto -c -k --sequesterRsrc --keepParent "$app" "artifacts/DevBox-macos26-$ARCH-developer-id-notarized-app.zip"
-          (cd artifacts && shasum -a 256 ./*.zip > SHA256SUMS.txt)
+          ditto "$dmg" "artifacts/DevBox-macos-$ARCH.dmg"
+          (cd artifacts && shasum -a 256 "DevBox-macos-$ARCH.dmg" > SHA256SUMS.txt)
       - name: Remove any remaining ephemeral credentials
         if: always()
         run: |
@@ -72,11 +98,47 @@ jobs:
             security delete-keychain "$directory/release.keychain-db" >/dev/null 2>&1 || true
             rm -rf "$directory"
           done
-      - name: Upload notarized app (does not publish a GitHub Release)
+      - name: Upload notarized disk image
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: DevBox-macos26-arm64-developer-id-notarized
+          name: DevBox-macos-arm64
           path: artifacts/
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+  publish:
+    name: Publish signed download
+    if: github.ref == 'refs/heads/main' && inputs.publish
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: github-release-v${{ needs.release.outputs.version }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_VERSION: ${{ needs.release.outputs.version }}
+    steps:
+      - name: Download signed assets from this exact run
+        run: |
+          gh run download "$GITHUB_RUN_ID" \
+            --name DevBox-macos-arm64 --dir "$RUNNER_TEMP/signed-downloads"
+      - name: Verify checksums and publish from a draft
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/signed-downloads"
+          sha256sum DevBox-macos-arm64.dmg | diff - SHA256SUMS.txt
+          tag="v$RELEASE_VERSION"
+          # Creating the exact ref fails if it already exists; never move a tag.
+          gh api --method POST "repos/$GH_REPO/git/refs" --silent \
+            -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA"
+          gh release create "$tag" --verify-tag --target "$GITHUB_SHA" \
+            --draft --title "DevBox $RELEASE_VERSION" \
+            --notes "Requires Apple Silicon and macOS 26 or newer. Open the DMG, drag DevBox into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional; MariaDB is installed separately."
+          gh release upload "$tag" DevBox-macos-arm64.dmg SHA256SUMS.txt
+          gh release edit "$tag" --draft=false --latest

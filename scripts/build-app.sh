@@ -6,15 +6,6 @@ configuration="${CONFIGURATION:-debug}"
 signing_identity="${DEVBOX_SIGNING_IDENTITY:-Devbox Local Development}"
 build_directory="${BUILD_DIR:-$PWD/build}"
 swift_build_path="${SWIFT_BUILD_PATH:-$PWD/.build}"
-# Resolve only the configured Developer ID, before spending time on the build.
-# codesign accepts a certificate fingerprint, avoiding its name-matching behavior.
-signing_certificate="$signing_identity"
-case "$signing_identity" in
-    "Developer ID Application:"*)
-        signing_certificate="$(python3 scripts/signing_identity.py)"
-        printf 'Validated the configured Developer ID signing identity.\n'
-        ;;
-esac
 swift build --scratch-path "$swift_build_path" -c "$configuration"
 binary_directory="$(swift build --scratch-path "$swift_build_path" -c "$configuration" --show-bin-path)"
 app="$build_directory/DevBox.app"
@@ -32,7 +23,7 @@ if [ -f "$app/Contents/Resources/DevBox.icns" ]; then
     /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string DevBox" "$app/Contents/Info.plist"
 fi
 # Keep the local identity default; ad hoc CI explicitly supplies "-".
-set -- --force --sign "$signing_certificate"
+set -- --force --sign "$signing_identity"
 case "$signing_identity" in
     "Developer ID Application:"*)
         set -- "$@" --options runtime --timestamp --entitlements Resources/DevBox.entitlements

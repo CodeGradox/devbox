@@ -39,7 +39,7 @@ captures as `branches.900.png` and `branches.1140.png`.
 
 ## Ordinary CI: no credentials
 
-`build.yml` runs for pull requests, pushes to `main`, `v*` tags, and manual
+`build.yml` runs for pull requests, pushes to `main`, and manual
 dispatch. It runs `sh scripts/test.sh`, builds an optimized arm64 release app,
 checks its architecture, deployment target, and ad hoc signature, and uploads
 app and standalone-executable ZIPs plus SHA-256 checksums. Download them from
@@ -58,7 +58,7 @@ not part of these jobs.
 
 Build jobs grant only `contents: read`, pin official checkout and upload
 actions to full commit SHAs, and disable checkout credential persistence.
-Only the tag-triggered publishing job gets `contents: write` and `actions: read`,
+Only the opt-in signed-release publishing job gets `contents: write` and `actions: read`,
 using GitHub's automatic short-lived token rather than a personal access token.
 The pins were checked against GitHub's public tag API:
 
@@ -71,45 +71,49 @@ There is no `pull_request_target` or CI signing secret. Pull requests and ordina
 branch pushes cannot publish releases. Review action updates and verify replacement
 SHAs before changing pins.
 
-## Version tags publish downloads
+## Build or publish a signed release
 
-After the native arm64 build and tests succeed, a push of a stable version tag
-(`vMAJOR.MINOR.PATCH`) publishes the app ZIP and its `SHA256SUMS.txt`
-to a GitHub Release. The job downloads only artifacts from that same workflow run
-and checks their hashes before uploading. It publishes from a draft only after
-all assets have uploaded successfully; failed uploads leave an unpublished draft.
-A retry may finish a draft for the same commit but never overwrite a published release.
+Use **Actions → Release DevBox → Run workflow**, selecting **main**.
+The workflow uses the protected `release` environment. It builds and verifies a
+Developer ID-signed, notarized disk image, **DevBox-macos-arm64.dmg**.
 
-Before tagging, update `CFBundleShortVersionString` in `Resources/Info.plist`
-and commit/push it. The workflow verifies that the tag matches the app's version:
+- Leave **publish** unchecked (the default) to test a signed build without
+  publishing. Download the **DevBox-macos-arm64** artifact from that run. GitHub
+  wraps Actions artifacts in a ZIP containing the DMG and `SHA256SUMS.txt`;
+  that wrapper is only for CI downloads.
+- Check **publish** to create a GitHub Release after all signing, notarization,
+  and packaging checks pass. Users download the DMG directly, without an outer
+  ZIP or nested folders. The optional checksum file is a separate release asset.
 
-```sh
-git tag -a v0.1.0 -m "DevBox v0.1.0"
-git push origin refs/tags/v0.1.0
-```
+Before publishing, update `CFBundleShortVersionString` and `CFBundleVersion` in
+`Resources/Info.plist`, then commit/push to `main`. Use a fresh stable semantic
+version (`MAJOR.MINOR.PATCH`). The publishing job creates `vVERSION` at the exact
+build commit and refuses an existing tag. It never moves tags or replaces assets.
+There is no need to create/push a tag manually; tag pushes no longer publish
+ad-hoc downloads.
 
-For later releases use a new version; do not move an existing release tag.
-Download from [the latest release](https://github.com/CodeGradox/devbox/releases/latest)
-or the README's Apple Silicon link. Release assets have no Actions
-retention expiry or extra artifact-wrapper ZIP. Private repositories still require
-GitHub authentication/access; this workflow never changes repository visibility.
-These downloads remain **ad-hoc signed and non-notarized**.
+The publishing job uses ordinary `gh release` commands: download the signed
+artifact from this exact run, verify its checksum, create a new tag and draft,
+upload the DMG and checksum, then publish. No signing credentials are exposed
+to this job. If uploading fails, the draft stays unpublished; recover that
+unpublished draft manually or use a new version. There is no automatic overwrite
+or draft-resume logic.
 
-## Optional Apple-trusted manual build
+Selecting another branch or tag skips both signing and publishing. There is no
+arbitrary checkout-ref input. Release assets have no Actions retention expiry.
+Download from [the latest release](https://github.com/CodeGradox/devbox/releases/latest).
+Existing releases through v0.3.1 remain ad-hoc signed; they are not replaced.
 
-`release.yml` is a real, opt-in signing and notarization workflow. It only runs
-via **Run workflow** on `main`, uses the protected `release` environment, and
-uploads stapled app archives; it does **not** create or publish GitHub Releases.
-There is no arbitrary checkout-ref input. Selecting any other branch or tag
-skips the signing job. It signs the native arm64 app.
+## Apple signing credentials
 
 Before enabling it:
 
-1. Protect `main` with review requirements, especially changes to workflows,
-   scripts, entitlements, package manifests, and application source.
-2. Create a GitHub environment named **release**. Require trusted reviewers,
-   prevent self-review where available, and restrict deployment branches to
-   **main only**. Do not enable signing until these protections are configured.
+1. Protect `main` against deletion and force-pushes, and limit write access to
+   trusted maintainers. Review workflow, script, entitlement, dependency, and
+   application changes before signing them.
+2. Create a GitHub environment named **release** and restrict deployment branches
+   to **main only**. Add trusted required reviewers if appropriate for your team.
+   Do not enable signing until the environment restrictions are configured.
    A workflow's `if` guard alone is not a boundary against someone who can
    change a workflow on another branch.
 3. Join the paid **Apple Developer Program**, or use your existing team's membership.
@@ -141,27 +145,18 @@ Base64 is encoding, not encryption. Supply these directly through GitHub's
 secret UI or your approved secret-management tooling; never paste them into
 source files, issues, or this conversation.
 
-6. Dispatch **Manual Developer ID notarized apps** on `main`; reviewers should
+6. Dispatch **Release DevBox** on `main`; reviewers should
    verify the exact run commit before approving environment access. Tests run
    before credentials are imported. The release step imports the supplied
-   certificate into a temporary runner keychain. Before building, it checks for
-   exactly one valid code-signing certificate matching `DEVBOX_SIGNING_IDENTITY`
-   in that keychain, accepting canonically equivalent Unicode names. It signs by
-   the matching certificate's SHA-1 fingerprint to avoid name-lookup ambiguity,
-   retaining hardened runtime and a secure timestamp. It then submits to Apple,
-   requires an `Accepted` result, staples the ticket, and checks Gatekeeper
-   assessment.
+   certificate into a temporary keychain and signs the app with hardened runtime
+   and a secure timestamp. It packages the app with `dmgbuild`, signs the DMG,
+   and submits that final distribution to Apple once. Apple checks the app inside
+   too. Only an `Accepted` result allows stapling the DMG's ticket, validating it,
+   and checking Gatekeeper. No Developer ID Installer certificate is needed.
 
-An import reporting `1 identity imported` does not prove the `.p12` contains the
-expected, valid Developer ID identity. The preflight distinguishes an unusable
-identity, a local/non-Developer-ID certificate, a name/team mismatch, and multiple
-matching certificates without logging the imported names or private credentials.
-Follow the reported category: fix mismatched `release` environment secrets, or
-investigate certificate validity, trust, and keychain access if no valid identity
-can be found. Do not switch to an arbitrary available certificate. A secret-only
-correction can use **Re-run failed jobs**. Changes to the scripts require a new
-**Run workflow** after those changes reach `main`; rerunning an old run uses its
-original commit.
+Use the exact certificate name for `DEVBOX_SIGNING_IDENTITY`. A secret-only
+correction can use **Re-run failed jobs** for signing. Script changes require a
+new **Run workflow** after reaching `main`; rerunning an old run uses old code.
 
 The script traps exit/signals to remove its temporary keychain and credential
 files, with an additional `always()` workflow cleanup step. Only ephemeral
@@ -173,10 +168,43 @@ searchable and the default keychain is not changed. This follows
 [GitHub's runner signing setup](https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications):
 `codesign --keychain` alone is not sufficient runner setup, even when
 `security find-identity` can find the identity in that keychain.
-No raw credentials, submission ZIP, or notary response file is uploaded.
-The downloaded app is re-zipped **after** stapling. If a signing/notary check
+No raw credentials or notary response file is uploaded.
+The checksum is computed from the final stapled DMG. If a signing/notary check
 fails, the job does not upload a release artifact. Review the Apple submission
 ID in the log and retrieve diagnostics through your approved developer tools.
+
+## Local disk image packaging
+
+The image opens with `DevBox.app` on the left and a shortcut to `/Applications`
+on the right, with an arrow between them. Drag the app across, eject the image,
+and launch DevBox from Applications. This is a file copy, not an installer package;
+it does not install MariaDB or run privileged installation scripts.
+
+Packaging uses the maintained [dmgbuild](https://dmgbuild.readthedocs.io/) tool,
+without Finder or AppleScript. The only Python source is a small layout settings
+file. Preparation needs Python 3.10+ and installs hash-locked tool dependencies
+into a private virtual environment:
+
+```sh
+sh scripts/prepare-dmg-tools.sh
+sh scripts/build-dmg.sh /path/to/DevBox.app /existing/output/directory/DevBox-macos-arm64.dmg
+```
+
+The default tools directory is `.build/dmg-tools`; when `BUILD_DIR` is set it is
+`$BUILD_DIR/dmg-tools`. `DMG_TOOLS_DIR` can override it. Use the same settings for
+preparation and packaging. In CI, preparation and a real fixture-image test run
+**before** signing secrets are imported; packaging itself performs no downloads.
+The packager never signs or changes the source app, refuses existing output
+files, and mounts the finished image to verify the app signature and Applications
+shortcut. Its local output is an **unsigned DMG**, not a verified public release.
+
+To build and inspect a real image containing an ad-hoc-signed fixture, without
+private signing keys or contacting the notarization service:
+
+```sh
+sh scripts/prepare-dmg-tools.sh
+sh scripts/test-dmg.sh
+```
 
 ## Gatekeeper, Keychain, and MariaDB
 
@@ -190,8 +218,8 @@ ID in the log and retrieve diagnostics through your approved developer tools.
   between local, ad hoc, and Developer ID builds may prompt again or require
   re-entering a password. Notarization does not bypass authentication prompts.
 - The app dynamically loads an **external Homebrew MariaDB client library**.
-  Neither archive bundles or downloads this library, nor installs/starts a
-  database server. Install a compatible native MariaDB connector (for example
+  Neither CI archives nor the disk image install the library or a database
+  server. Install a compatible native MariaDB connector (for example
   `brew install mariadb-connector-c`) or supported MariaDB server package and
   configure the local database separately. Native Apple Silicon Homebrew normally
   uses `/opt/homebrew`. The client library must be arm64 to
