@@ -166,7 +166,13 @@ original commit.
 The script traps exit/signals to remove its temporary keychain and credential
 files, with an additional `always()` workflow cleanup step. Only ephemeral
 GitHub-hosted runners are supported; forced machine termination ultimately
-relies on runner disposal. The runner's normal/default keychain is not replaced.
+relies on runner disposal. Before creating its keychain, the script saves the
+runner's user keychain search list. It prepends the temporary keychain for signing
+and restores the saved list in its cleanup trap; existing keychains remain
+searchable and the default keychain is not changed. This follows
+[GitHub's runner signing setup](https://docs.github.com/en/actions/how-tos/deploy/deploy-to-third-party-platforms/sign-xcode-applications):
+`codesign --keychain` alone is not sufficient runner setup, even when
+`security find-identity` can find the identity in that keychain.
 No raw credentials, submission ZIP, or notary response file is uploaded.
 The downloaded app is re-zipped **after** stapling. If a signing/notary check
 fails, the job does not upload a release artifact. Review the Apple submission
