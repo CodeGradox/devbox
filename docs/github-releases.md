@@ -144,9 +144,24 @@ source files, issues, or this conversation.
 6. Dispatch **Manual Developer ID notarized apps** on `main`; reviewers should
    verify the exact run commit before approving environment access. Tests run
    before credentials are imported. The release step imports the supplied
-   certificate into a temporary runner keychain, signs with hardened runtime
-   and a secure timestamp, submits to Apple, requires an `Accepted` result,
-   staples the ticket, and checks Gatekeeper assessment.
+   certificate into a temporary runner keychain. Before building, it checks for
+   exactly one valid code-signing certificate matching `DEVBOX_SIGNING_IDENTITY`
+   in that keychain, accepting canonically equivalent Unicode names. It signs by
+   the matching certificate's SHA-1 fingerprint to avoid name-lookup ambiguity,
+   retaining hardened runtime and a secure timestamp. It then submits to Apple,
+   requires an `Accepted` result, staples the ticket, and checks Gatekeeper
+   assessment.
+
+An import reporting `1 identity imported` does not prove the `.p12` contains the
+expected, valid Developer ID identity. The preflight distinguishes an unusable
+identity, a local/non-Developer-ID certificate, a name/team mismatch, and multiple
+matching certificates without logging the imported names or private credentials.
+Follow the reported category: fix mismatched `release` environment secrets, or
+investigate certificate validity, trust, and keychain access if no valid identity
+can be found. Do not switch to an arbitrary available certificate. A secret-only
+correction can use **Re-run failed jobs**. Changes to the scripts require a new
+**Run workflow** after those changes reach `main`; rerunning an old run uses its
+original commit.
 
 The script traps exit/signals to remove its temporary keychain and credential
 files, with an additional `always()` workflow cleanup step. Only ephemeral
