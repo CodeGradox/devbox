@@ -87,6 +87,10 @@ Local Git and database features remain available without GitHub sign-in.
 Results are cached while the app is open. Deletion updates the cache without
 rescanning everything else; use **Refresh** (`⌘R`) when you want fresh values.
 For fresh remote branch information, use **Fetch & Prune**.
+Switching between **Worktrees** and **Branches** keeps jobs running and preserves
+each tab's selection and scroll position. Switching projects cancels unfinished
+read-only work but retains completed results; returning schedules the missing
+work again. An explicit **Fetch & Prune** finishes in its original project.
 Light, dark, and system appearance are supported.
 
 **Deletion is permanent** and requires Touch ID or your Mac login password.

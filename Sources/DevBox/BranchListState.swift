@@ -90,7 +90,9 @@ struct BranchRowPresentation: Identifiable, Equatable {
 /// not a live view of the server.
 @MainActor @Observable
 final class BranchListState {
+    let loading = ProjectLoadingState()
     private(set) var rows: [BranchRowPresentation] = []
+    private(set) var visibleGitHubBranches: Set<GitHubBranch> = []
     private(set) var hasLoadedInventory = false
     var selection: Set<String> = []
     var filter: BranchFilter = .all {
@@ -183,6 +185,8 @@ final class BranchListState {
             return order == .orderedSame ? lhs.id < rhs.id : order == .orderedAscending
         }
         if rows != next { rows = next }
+        let branches = Set(next.compactMap(\.githubBranch))
+        if visibleGitHubBranches != branches { visibleGitHubBranches = branches }
         selection.formIntersection(Set(next.map(\.id)))
     }
 }

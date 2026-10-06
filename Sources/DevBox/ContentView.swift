@@ -124,7 +124,7 @@ private struct SidebarView: View {
                             Button("Edit Connection…") {
                                 store.connectionEditor = .init(connection: connection)
                             }
-                            Button("Remove Connection") { store.forgetConnection(connection) }
+                            Button("Remove Connection") { Task { await store.forgetConnection(connection) } }
                         }
                 }
                 Button {
@@ -242,12 +242,11 @@ private struct ProjectView: View {
             .padding(.vertical, 8)
             .help(project.path)
             Divider()
-            switch store.projectSection {
-            case .worktrees:
-                WorktreesView(project: project, session: session)
-            case .branches:
-                BranchesView(project: project, session: session.branchList)
-            }
+            RetainedProjectPanes(
+                projectID: project.id, selection: store.projectSection,
+                worktrees: { AnyView(WorktreesView(project: project, session: session)) },
+                branches: { AnyView(BranchesView(project: project, session: session.branchList)) }
+            )
         }
     }
 }
@@ -303,7 +302,7 @@ private struct WorktreeTable: View {
     var body: some View {
         @Bindable var store = store
         @Bindable var session = session
-        if let error = store.loadError {
+        if let error = session.worktreeLoading.error {
             LoadErrorView(message: error, retry: store.refresh)
         } else {
             Table(session.tableRows, selection: $store.worktreeSelection, sortOrder: $session.sortOrder) {
@@ -335,7 +334,7 @@ private struct WorktreeTable: View {
             }
             .overlay {
                 if session.tableRows.isEmpty {
-                    if store.isRefreshing {
+                    if session.worktreeLoading.isLoading {
                         ProgressView("Loading worktrees…")
                     } else {
                         ContentUnavailableView(
@@ -346,6 +345,7 @@ private struct WorktreeTable: View {
                 }
             }
             .onChange(of: session.tableRows.map(\.id), initial: true) { _, ids in
+                guard store.selectedProjectSession === session else { return }
                 let selection = store.worktreeSelection.intersection(ids)
                 if selection != store.worktreeSelection { store.worktreeSelection = selection }
             }
@@ -479,10 +479,15 @@ struct DetailHeader<Accessory: View>: View {
 struct StatusFooter<Content: View>: View {
     @Environment(AppStore.self) private var store
     let session: ProjectSessionState?
+    let loading: ProjectLoadingState?
     let content: Content
 
-    init(session: ProjectSessionState? = nil, @ViewBuilder content: () -> Content) {
+    init(
+        session: ProjectSessionState? = nil, loading: ProjectLoadingState? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
         self.session = session
+        self.loading = loading ?? session?.worktreeLoading
         self.content = content()
     }
 
@@ -491,9 +496,10 @@ struct StatusFooter<Content: View>: View {
         HStack(spacing: 8) {
             content.lineLimit(1)
             Spacer()
-            if store.isRefreshing || store.isDeleting {
+            if (loading?.isLoading ?? store.isRefreshing) || store.isDeleting {
                 ProgressView().controlSize(.mini)
-                Text(store.progressText).lineLimit(1).truncationMode(.middle)
+                Text(store.isDeleting ? store.progressText : (loading?.progress ?? store.progressText))
+                    .lineLimit(1).truncationMode(.middle)
             } else if let session, session.isMeasuringSizes {
                 ProgressView().controlSize(.mini)
                 Text(session.sizeProgressText).lineLimit(1)

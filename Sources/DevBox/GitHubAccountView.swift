@@ -26,11 +26,14 @@ struct GitHubAccountView: View {
         VStack(alignment: .leading, spacing: 16) {
             Label("GitHub Account", systemImage: "person.crop.circle")
                 .font(.title2.bold())
-            if let user = session.user {
+            if session.isSigningOut {
+                ProgressView("Removing saved GitHub sign-in…")
+            } else if let user = session.user {
                 Text("Signed in as **\(user.login)**")
                 Text("DevBox can read pull requests in repositories available to both you and the GitHub App.")
                     .foregroundStyle(.secondary)
-                Button("Sign out of DevBox", role: .destructive, action: session.signOut)
+                Button("Sign out of DevBox", role: .destructive) { Task { await session.signOut() } }
+                    .disabled(session.isSigningOut)
                 Text("Sign-out removes this Mac’s saved tokens. To revoke access on GitHub too, use your GitHub application settings.")
                     .font(.caption).foregroundStyle(.secondary)
             } else if session.isRestoring {
@@ -52,9 +55,11 @@ struct GitHubAccountView: View {
                 Text("Code expires \(authorization.expiresAt.formatted(date: .omitted, time: .shortened)).")
                     .font(.caption).foregroundStyle(.secondary)
                 Button("Cancel sign-in", action: session.cancelSignIn)
+                    .disabled(session.isSavingCredential)
             } else if session.isSigningIn {
                 ProgressView("Requesting a GitHub sign-in code…")
                 Button("Cancel sign-in", action: session.cancelSignIn)
+                    .disabled(session.isSavingCredential)
             } else {
                 Text("Sign in in your browser to see the latest pull request for each published GitHub branch.")
                 Text("Access and refresh tokens are stored only in macOS Keychain. No client secret or private key is needed.")
@@ -66,11 +71,20 @@ struct GitHubAccountView: View {
                 Label(error, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
                     .textSelection(.enabled)
-                if session.user == nil && !session.isSigningIn && !session.isRestoring {
+                if session.credentialAccessFailed {
                     HStack {
-                        Button("Retry saved sign-in") { Task { await session.restore() } }
-                        Button("Forget saved sign-in", action: session.signOut)
+                        Button("Retry Keychain access") { Task { await session.retryCredentialAccess() } }
+                        if session.user == nil {
+                            Button("Forget saved sign-in") { Task { await session.signOut() } }
+                        }
                     }
+                    .disabled(session.isSigningOut || session.isSavingCredential || session.isRestoring)
+                } else if session.user == nil && !session.isSigningIn && !session.isRestoring {
+                    HStack {
+                        Button("Retry saved sign-in") { Task { await session.retryCredentialAccess() } }
+                        Button("Forget saved sign-in") { Task { await session.signOut() } }
+                    }
+                    .disabled(session.isSigningOut)
                 }
             }
             Divider()
@@ -80,10 +94,12 @@ struct GitHubAccountView: View {
             HStack {
                 Spacer()
                 Button("Done") { dismiss() }.keyboardShortcut(.cancelAction)
+                    .disabled(session.isSavingCredential && session.isSigningIn)
             }
         }
         .padding(24)
         .frame(width: 480)
+        .interactiveDismissDisabled(session.isSavingCredential && session.isSigningIn)
         .onDisappear { session.cancelSignIn() }
     }
 }

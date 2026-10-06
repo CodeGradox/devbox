@@ -5,6 +5,34 @@ import DevBoxCore
 
 @MainActor
 struct BranchListStateTests {
+    @Test func visibleGitHubBranchesFollowMembershipAndURLs() {
+        let session = BranchListState()
+        let first = ManagedBranch(
+            reference: "refs/heads/a", name: "a", commit: "1",
+            committerName: "A", committerEmail: "a@example.invalid",
+            githubURL: URL(string: "https://github.com/example/repo/tree/a")
+        )
+        let second = ManagedBranch(
+            reference: "refs/heads/b", name: "b", commit: "2",
+            committerName: "B", committerEmail: "b@example.invalid",
+            githubURL: URL(string: "https://github.com/example/repo/tree/b")
+        )
+        session.reconcile([first, second])
+        #expect(session.visibleGitHubBranches.count == 2)
+        session.query = "a"
+        // Both emails contain "a"; filter by the complete identity instead.
+        session.committer = BranchCommitter(name: "A", email: "a@example.invalid")
+        #expect(session.visibleGitHubBranches == Set(session.rows.compactMap(\.githubBranch)))
+        #expect(session.visibleGitHubBranches.count == 1)
+        session.sortOrder = [.init(column: .branch)]
+        session.refreshPresentation()
+        #expect(session.visibleGitHubBranches.count == 1)
+        session.removeConfirmedBranches(ids: [first.reference])
+        #expect(session.visibleGitHubBranches == Set(session.rows.compactMap(\.githubBranch)))
+        session.reconcile([])
+        #expect(session.visibleGitHubBranches.isEmpty)
+    }
+
     private func branch(
         _ reference: String, name: String = "topic", date: Date? = nil,
         committer: String = "Pat Developer", email: String = "pat@example.com",

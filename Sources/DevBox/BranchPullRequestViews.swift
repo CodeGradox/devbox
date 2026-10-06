@@ -8,11 +8,6 @@ struct BranchPullRequestControls: View {
     let disabled: Bool
     let showAccount: () -> Void
 
-    private struct LoadID: Equatable {
-        let account: UUID
-        let branches: Set<GitHubBranch>
-    }
-
     var body: some View {
         Button {
             if session.user != nil {
@@ -30,10 +25,6 @@ struct BranchPullRequestControls: View {
         .disabled(disabled || session.isRestoring ||
                   (session.user != nil && (branches.isEmpty || session.pullRequests.isLoading)))
         .modifier(GitHubRateLimitGate(retryAt: session.pullRequests.rateLimitRetryAt))
-        .task(id: LoadID(account: session.accountGeneration, branches: branches)) {
-            session.pullRequests.load(branches, session: session)
-        }
-        .onDisappear { session.pullRequests.cancelLoading() }
     }
 }
 

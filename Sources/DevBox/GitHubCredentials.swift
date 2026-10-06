@@ -4,14 +4,48 @@ import Security
 
 @MainActor
 protocol GitHubCredentialsPersisting {
+    func load() async throws -> GitHubToken?
+    func save(_ token: GitHubToken) async throws
+    func remove() async throws
+}
+
+/// Separate from database credentials and settings.json. Neither token is synced
+/// through iCloud or written to the repository, preferences, or logs.
+final class GitHubKeychainCredentials: GitHubCredentialsPersisting {
+    private let backend: any GitHubCredentialBackend
+    private var read: Task<GitHubToken?, Error>?
+
+    init(backend: any GitHubCredentialBackend = SecurityGitHubCredentialBackend()) {
+        self.backend = backend
+    }
+
+    func load() async throws -> GitHubToken? {
+        if let read { return try await read.value }
+        let backend = backend
+        let task = Task { try await KeychainExecutor.shared.run { try backend.load() } }
+        read = task
+        defer { read = nil }
+        return try await task.value
+    }
+
+    func save(_ token: GitHubToken) async throws {
+        let backend = backend
+        try await KeychainExecutor.shared.run { try backend.save(token) }
+    }
+
+    func remove() async throws {
+        let backend = backend
+        try await KeychainExecutor.shared.run { try backend.remove() }
+    }
+}
+
+protocol GitHubCredentialBackend: Sendable {
     func load() throws -> GitHubToken?
     func save(_ token: GitHubToken) throws
     func remove() throws
 }
 
-/// Separate from database credentials and settings.json. Neither token is synced
-/// through iCloud or written to the repository, preferences, or logs.
-struct GitHubKeychainCredentials: GitHubCredentialsPersisting {
+struct SecurityGitHubCredentialBackend: GitHubCredentialBackend {
     private var query: [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,

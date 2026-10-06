@@ -8,16 +8,16 @@ struct BranchesView: View {
     @AppStorage("devbox.gravatarEnabled") private var gravatarEnabled = false
     @State private var showsOptions = false
 
-    private var busy: Bool { store.isRefreshing || store.isDeleting || store.isModalPresented }
+    private var busy: Bool { session.loading.isLoading || store.isDeleting || store.isModalPresented }
 
     var body: some View {
         @Bindable var session = session
         VStack(spacing: 0) {
             controls
-            if let error = store.loadError, session.rows.isEmpty {
+            if let error = session.loading.error, session.rows.isEmpty {
                 LoadErrorView(message: error, retry: store.refresh)
             } else {
-                if let error = store.loadError {
+                if let error = session.loading.error {
                     Label("Refresh failed. Showing last-known branches.", systemImage: "exclamationmark.triangle")
                         .font(.callout).foregroundStyle(.orange).help(error)
                         .padding(.vertical, 8)
@@ -54,7 +54,7 @@ struct BranchesView: View {
                 }
                 .overlay {
                     if session.rows.isEmpty {
-                        if store.isRefreshing {
+                        if session.loading.isLoading {
                             ProgressView("Reading branches…")
                         } else {
                             ContentUnavailableView(
@@ -65,10 +65,10 @@ struct BranchesView: View {
                     }
                 }
             }
-            StatusFooter {
+            StatusFooter(loading: session.loading) {
                 Text("\(session.rows.count) branches · \(session.selectedBranches.count) selected")
                 BranchPullRequestStatus(
-                    branches: Set(session.rows.compactMap(\.githubBranch)),
+                    branches: session.visibleGitHubBranches,
                     session: store.github, disabled: busy,
                     showAccount: { store.activeSheet = .github() }
                 )
@@ -86,16 +86,13 @@ struct BranchesView: View {
                     ForEach(BranchFilter.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .labelsHidden().frame(width: 100)
-                Picker("Committer", selection: $session.committer) {
-                    Text("All committers").tag(nil as BranchCommitter?)
-                    ForEach(session.committers) { Text($0.label).tag(Optional($0)) }
-                }
-                .labelsHidden().frame(width: 185)
+                CommitterPopUpButton(options: session.committers, selection: $session.committer)
+                    .frame(width: 185)
                 Button("Fetch & Prune", action: store.fetchBranches)
                     .help("Contacts all remotes, fetches branches, and prunes obsolete remote tracking refs.")
                     .disabled(busy)
                 BranchPullRequestControls(
-                    branches: Set(session.rows.compactMap(\.githubBranch)),
+                    branches: session.visibleGitHubBranches,
                     session: store.github, disabled: busy,
                     showAccount: { store.activeSheet = .github() }
                 )
@@ -107,7 +104,7 @@ struct BranchesView: View {
                 .accessibilityLabel("Branch information and options")
                 .popover(isPresented: $showsOptions) { options }
             }
-            if !session.hasLoadedInventory && !store.isRefreshing {
+            if !session.hasLoadedInventory && !session.loading.isLoading {
                 Label("Inventory needs verification. Refresh local refs, or Fetch & Prune to check remotes, before deleting.",
                       systemImage: "exclamationmark.triangle")
                     .font(.caption).foregroundStyle(.orange)

@@ -14,6 +14,8 @@ struct ConnectionEditor: View {
     @State private var useSocket: Bool
     @State private var socketPath: String
     @State private var isTesting = false
+    @State private var isSaving = false
+    @State private var isLoadingCredential = false
     @State private var message: String?
     @State private var testSucceeded = false
     @State private var credentialLoadFailed = false
@@ -70,27 +72,34 @@ struct ConnectionEditor: View {
                 }
             }
             .formStyle(.grouped)
-            .disabled(isTesting)
+            .disabled(isTesting || isSaving || isLoadingCredential)
             Divider()
             HStack {
                 Button("Test Connection") { test() }
-                    .disabled(!valid || isTesting)
-                if isTesting { ProgressView().controlSize(.small) }
+                    .disabled(!valid || isTesting || isSaving || isLoadingCredential)
+                if isTesting || isSaving || isLoadingCredential { ProgressView().controlSize(.small) }
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                    .disabled(isTesting)
+                    .disabled(isTesting || isSaving)
                 Button("Save") { save() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(!valid || isTesting || credentialLoadFailed)
+                    .disabled(!valid || isTesting || isSaving || isLoadingCredential || credentialLoadFailed)
             }
             .padding(20)
         }
         .frame(width: 520, height: 550)
-        .interactiveDismissDisabled(isTesting)
+        .interactiveDismissDisabled(isTesting || isSaving)
         .task {
             guard let existing else { return }
-            do { password = try store.password(for: existing.id) }
+            isLoadingCredential = true
+            defer { isLoadingCredential = false }
+            do {
+                let saved = try await store.password(for: existing.id)
+                try Task.checkCancellation()
+                password = saved
+            }
+            catch is CancellationError {}
             catch {
                 credentialLoadFailed = true
                 message = "\(error.localizedDescription)\nEnter the password again to update this connection."
@@ -132,13 +141,19 @@ struct ConnectionEditor: View {
     }
 
     private func save() {
-        do {
-            try store.saveConnection(connection, password: password)
-            password = ""
-            dismiss()
-        } catch {
-            testSucceeded = false
-            message = error.localizedDescription
+        isSaving = true
+        let connection = connection
+        let secret = password
+        Task {
+            defer { isSaving = false }
+            do {
+                try await store.saveConnection(connection, password: secret)
+                password = ""
+                dismiss()
+            } catch {
+                testSucceeded = false
+                message = error.localizedDescription
+            }
         }
     }
 }

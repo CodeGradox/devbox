@@ -11,6 +11,9 @@ final class GitHubSession {
     private(set) var authorization: GitHubDeviceAuthorization?
     private(set) var isSigningIn = false
     private(set) var isRestoring = false
+    private(set) var isSigningOut = false
+    private(set) var credentialAccessFailed = false
+    private(set) var isSavingCredential = false
     private(set) var errorMessage: String?
     private(set) var accountGeneration = UUID()
     let pullRequests: GitHubPullRequestCache
@@ -21,6 +24,8 @@ final class GitHubSession {
     @ObservationIgnored private var signInTask: Task<Void, Never>?
     @ObservationIgnored private var refreshTask: Task<String, Error>?
     @ObservationIgnored private var didAttemptRestore = false
+    @ObservationIgnored private var credentialFailure: Error?
+    @ObservationIgnored private var credentialWrite: Task<Void, Error>?
     private let credentials: any GitHubCredentialsPersisting
     private let startAuthorization: @Sendable () async throws -> GitHubDeviceAuthorization
     private let poll: @Sendable (GitHubDeviceAuthorization) async throws -> GitHubToken
@@ -64,14 +69,27 @@ final class GitHubSession {
     }
 
     func restore() async {
-        guard !isRestoring, !isSigningIn, user == nil else { return }
+        guard !isRestoring, !isSigningIn, !isSigningOut, user == nil else { return }
         let generation = operationGeneration
         isRestoring = true
         errorMessage = nil
         defer { if generation == operationGeneration { isRestoring = false } }
         do {
-            token = try credentials.load()
-            guard token != nil else { return }
+            if let credentialFailure { throw credentialFailure }
+            if pendingToken == nil {
+                let saved: GitHubToken?
+                do {
+                    saved = try await credentials.load()
+                } catch {
+                    try checkOperation(generation)
+                    credentialFailure = error
+                    credentialAccessFailed = true
+                    throw error
+                }
+                try checkOperation(generation)
+                token = saved
+            }
+            guard pendingToken != nil || token != nil else { return }
             let identity = try await authorized { [loadUser] in try await loadUser($0) }
             try checkOperation(generation)
             user = identity
@@ -85,12 +103,14 @@ final class GitHubSession {
     }
 
     func beginSignIn() {
-        guard !isSigningIn, !isRestoring, user == nil else { return }
+        guard !isSigningIn, !isRestoring, !isSigningOut, user == nil else { return }
         cancelSignIn()
         operationGeneration = UUID()
         let generation = operationGeneration
         isSigningIn = true
         errorMessage = nil
+        credentialFailure = nil
+        credentialAccessFailed = false
         signInTask = Task {
             defer {
                 if generation == operationGeneration {
@@ -108,7 +128,8 @@ final class GitHubSession {
                 try checkOperation(generation)
                 let identity = try await loadUser(newToken.accessToken)
                 try checkOperation(generation)
-                try credentials.save(newToken)
+                pendingToken = newToken
+                try await saveCredential(newToken, generation: generation)
                 token = newToken
                 pendingToken = nil
                 user = identity
@@ -124,6 +145,9 @@ final class GitHubSession {
     }
 
     func cancelSignIn() {
+        // A Keychain write cannot be cancelled once submitted. Let this short
+        // commit phase finish; signOut instead explicitly orders removal after it.
+        guard !isSavingCredential else { return }
         guard isSigningIn || signInTask != nil else { return }
         signInTask?.cancel()
         signInTask = nil
@@ -132,11 +156,29 @@ final class GitHubSession {
         operationGeneration = UUID()
     }
 
-    func signOut() {
+    func signOut() async {
+        guard !isSigningOut else { return }
+        isSigningOut = true
+        defer { isSigningOut = false }
+        accountGeneration = UUID()
+        pullRequests.clear()
+        // A server may already have consumed the old refresh token. Drain that
+        // rotation before invalidating its generation: if Keychain later refuses
+        // removal, the still-visible account must keep the renewed pair.
+        // New authorization/sign-in requests are gated by isSigningOut.
+        if let refreshTask { _ = try? await refreshTask.value }
+        operationGeneration = UUID()
+        signInTask?.cancel()
+        refreshTask?.cancel()
+        signInTask = nil
+        refreshTask = nil
+        isSigningIn = false
+        isRestoring = false
+        authorization = nil
         // If Keychain refuses removal, keep the account visible so the user can
         // retry rather than silently signing back in on the next launch.
         do {
-            try credentials.remove()
+            try await removeCredential()
             clearAccount()
             errorMessage = nil
         } catch {
@@ -149,9 +191,11 @@ final class GitHubSession {
     func authorized<Value: Sendable>(
         _ operation: @escaping @Sendable (String) async throws -> Value
     ) async throws -> Value {
+        guard !isSigningOut else { throw CancellationError() }
         let generation = operationGeneration
         do {
             let accessToken = try await currentAccessToken()
+            guard !isSigningOut else { throw CancellationError() }
             try checkOperation(generation)
             do {
                 let value = try await operation(accessToken)
@@ -160,6 +204,7 @@ final class GitHubSession {
             } catch {
                 guard Self.isUnauthorized(error) else { throw error }
                 let replacement = try await currentAccessToken(rejected: accessToken)
+                guard !isSigningOut else { throw CancellationError() }
                 try checkOperation(generation)
                 let value = try await operation(replacement)
                 try checkOperation(generation)
@@ -169,10 +214,13 @@ final class GitHubSession {
             guard generation == operationGeneration else { throw CancellationError() }
             if Self.isUnauthorized(error) {
                 clearAccount()
+                let removalGeneration = operationGeneration
                 do {
-                    try credentials.remove()
+                    try await removeCredential()
+                    guard removalGeneration == operationGeneration else { throw CancellationError() }
                     errorMessage = "GitHub authorization expired or was revoked. Sign in again."
                 } catch {
+                    guard removalGeneration == operationGeneration else { throw CancellationError() }
                     errorMessage = Self.message(for: error)
                 }
             }
@@ -181,6 +229,8 @@ final class GitHubSession {
     }
 
     private func currentAccessToken(rejected: String? = nil) async throws -> String {
+        guard !isSigningOut else { throw CancellationError() }
+        if let credentialFailure { throw credentialFailure }
         guard let token = pendingToken ?? token else { throw GitHubAPIError.unauthorized }
         let needsRefresh = token.expiresAt.map { $0 <= now().addingTimeInterval(60) } ?? false
         let shouldRefresh = needsRefresh || token.accessToken == rejected
@@ -203,7 +253,7 @@ final class GitHubSession {
             // even if Keychain or the subsequent identity check is temporarily
             // unavailable; never retry using an already-consumed refresh token.
             pendingToken = renewed
-            try credentials.save(renewed)
+            try await saveCredential(renewed, generation: generation)
             let identity = try await loadUser(renewed.accessToken)
             try checkOperation(generation)
             guard user.map({ $0.id == identity.id }) ?? true else {
@@ -226,10 +276,61 @@ final class GitHubSession {
         refreshTask = nil
         token = nil
         pendingToken = nil
+        credentialFailure = nil
+        credentialAccessFailed = false
         user = nil
         isRestoring = false
         pullRequests.clear()
         accountGeneration = UUID()
+    }
+
+    /// Only explicit user intent clears a failed access latch. Keep a rotated
+    /// token in memory so retry never consumes the old refresh token twice.
+    func retryCredentialAccess() async {
+        guard !isSigningOut, !isSigningIn, !isRestoring else { return }
+        credentialFailure = nil
+        credentialAccessFailed = false
+        errorMessage = nil
+        if user == nil {
+            await restore()
+        } else {
+            do { _ = try await currentAccessToken() }
+            catch { errorMessage = Self.message(for: error) }
+        }
+    }
+
+    private func saveCredential(_ token: GitHubToken, generation: UUID) async throws {
+        try checkOperation(generation)
+        isSavingCredential = true
+        defer { isSavingCredential = false }
+        let previous = credentialWrite
+        let credentials = credentials
+        let write = Task {
+            _ = try? await previous?.value
+            try await credentials.save(token)
+        }
+        credentialWrite = write
+        do {
+            try await write.value
+            try checkOperation(generation)
+        } catch {
+            try checkOperation(generation)
+            credentialFailure = error
+            credentialAccessFailed = true
+            errorMessage = Self.message(for: error)
+            throw error
+        }
+    }
+
+    private func removeCredential() async throws {
+        let previous = credentialWrite
+        let credentials = credentials
+        let write = Task {
+            _ = try? await previous?.value
+            try await credentials.remove()
+        }
+        credentialWrite = write
+        try await write.value
     }
 
     private func checkOperation(_ generation: UUID) throws {

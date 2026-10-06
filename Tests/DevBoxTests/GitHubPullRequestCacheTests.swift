@@ -12,6 +12,47 @@ private func waitForGitHubCache(_ cache: GitHubPullRequestCache) async {
     }
 }
 
+@Test(.timeLimit(.minutes(1))) @MainActor
+func githubCacheDoesNotRetryCredentialDenialAcrossRepositoriesOrBatches() async {
+    let credentials = TestGitHubCredentials(githubTestToken)
+    let refreshes = GitHubTestCalls()
+    let cache = GitHubPullRequestCache(
+        repositories: { repository, _ in [repository] },
+        lookup: { branches, _, token in
+            if token == githubTestToken.accessToken { throw GitHubPullRequestError.unauthorized }
+            return GitHubPullRequestBatch(results: Dictionary(uniqueKeysWithValues: branches.map { ($0, .success(nil)) }))
+        }, now: { githubTestDate }
+    )
+    let session = testGitHubSession(credentials: credentials, cache: cache, refresh: { token in
+        await refreshes.record(token.accessToken)
+        return githubRenewedToken
+    })
+    await session.restore()
+    credentials.saveError = GitHubCredentialError(operation: "save", status: -128)
+    let branches = Set(["a/project", "b/project"].flatMap { repository in
+        (0..<80).map { GitHubBranch(repository: repository, name: "branch-\($0)") }
+    })
+    cache.load(branches, session: session)
+    await waitForGitHubCache(cache)
+    #expect(credentials.saveAttempts == 1)
+    #expect(cache.entries.count == branches.count)
+    #expect(cache.entries.values.allSatisfy {
+        if case .failed = $0 { return true }
+        return false
+    })
+    cache.load(branches, session: session, force: true)
+    await waitForGitHubCache(cache)
+    #expect(credentials.saveAttempts == 1)
+    #expect(await refreshes.values == [githubTestToken.accessToken])
+    credentials.saveError = nil
+    await session.retryCredentialAccess()
+    cache.load(branches, session: session, force: true)
+    await waitForGitHubCache(cache)
+    #expect(credentials.saveAttempts == 2)
+    #expect(await refreshes.values == [githubTestToken.accessToken])
+    #expect(!session.credentialAccessFailed)
+}
+
 private final class GitHubCacheClock: Sendable {
     private let storage = Mutex(githubTestDate)
     var date: Date { storage.withLock { $0 } }
@@ -155,7 +196,7 @@ func githubFailureSummaryGroupsVisibleBranchesByRepositoryAndCause() async {
         .init(repository: "owner/project", message: GitHubPullRequestError.notFound.localizedDescription, branchCount: 1)
     ])
     #expect(cache.failures(for: [absent]).isEmpty)
-    session.signOut()
+    await session.signOut()
     #expect(cache.failures(for: targets).isEmpty)
 }
 
@@ -193,7 +234,7 @@ func githubCacheDistinguishesAbsenceLookupFailureAndMetadataFailure() async {
     cache.load(targets, session: session, force: true)
     await waitForGitHubCache(cache)
     #expect(await calls.values.count == 4)
-    session.signOut()
+    await session.signOut()
     #expect(cache.entries.isEmpty)
     cache.load(targets, session: session)
     #expect(cache.entries.isEmpty)
@@ -399,7 +440,7 @@ func githubCacheDrainsInFlightSuccessAndKeepsLongestDeadline() async {
         cache.entries[$0] == .failed(GitHubPullRequestError.rateLimitExceeded(retryAt: lastDeadline).localizedDescription)
     })
     #expect(cache.rateLimitRetryAt == lastDeadline)
-    session.signOut()
+    await session.signOut()
     #expect(cache.rateLimitRetryAt == nil)
     #expect(cache.entries.isEmpty)
 }

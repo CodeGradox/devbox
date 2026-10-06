@@ -113,6 +113,10 @@ final class WorktreeState: Identifiable {
 @MainActor @Observable
 final class ProjectSessionState {
     let branchList = BranchListState()
+    let worktreeLoading = ProjectLoadingState()
+    var branchLoading: ProjectLoadingState { branchList.loading }
+    let inspectionLoading = ProjectLoadingState()
+    var isFetchingBranches = false
     private(set) var rows: [WorktreeState] = []
     // Publish sort/filter values only when they change. Hosted cells continue
     // observing their stable state references for measurement details and errors.
@@ -133,6 +137,7 @@ final class ProjectSessionState {
     private(set) var sizeProgressText = ""
     private(set) var isMeasuringSizes = false
     private(set) var hasLoadedInventory = false
+    @ObservationIgnored private(set) var branchInventoryRevision = UUID()
     @ObservationIgnored private var byID: [String: WorktreeState] = [:]
     @ObservationIgnored private var batchDepth = 0
     @ObservationIgnored private var summaryDirty = false
@@ -228,6 +233,23 @@ final class ProjectSessionState {
                 $0.isLoadingBranches = false
             }
         }
+    }
+
+    func cancelLoading(preservingFetch: Bool = false) {
+        worktreeLoading.cancel()
+        // Fetch mutates refs and cannot be rolled back by navigating away.
+        // Let it finish and verify its own project's cache before releasing it.
+        if !preservingFetch || !isFetchingBranches {
+            branchLoading.cancel()
+            isFetchingBranches = false
+        }
+        inspectionLoading.cancel()
+        pauseScans()
+    }
+
+    func invalidateBranchInventory() {
+        branchInventoryRevision = UUID()
+        branchList.invalidateInventory()
     }
 
     func updateRow(_ id: String, _ mutation: (inout WorktreeRow) -> Void) {

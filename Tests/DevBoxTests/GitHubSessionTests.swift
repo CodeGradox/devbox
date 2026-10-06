@@ -12,9 +12,22 @@ final class TestGitHubCredentials: GitHubCredentialsPersisting {
     var removals = 0
     var removalError: GitHubCredentialError?
     var saveError: GitHubCredentialError?
+    var loadError: GitHubCredentialError?
+    var saveGate: GitHubTestGate<Void>?
+    var loadGate: GitHubTestGate<Void>?
+    var loads = 0
+    var saveAttempts = 0
     init(_ token: GitHubToken? = nil) { self.token = token }
-    func load() throws -> GitHubToken? { token }
-    func save(_ token: GitHubToken) throws {
+    func load() async throws -> GitHubToken? {
+        loads += 1
+        let saved = token
+        if let loadGate { await loadGate.enter() }
+        if let loadError { throw loadError }
+        return saved
+    }
+    func save(_ token: GitHubToken) async throws {
+        saveAttempts += 1
+        if let saveGate { await saveGate.enter() }
         if let saveError { throw saveError }
         saves.append(token)
         self.token = token
@@ -123,12 +136,12 @@ func githubRestoreIsOnceAndSignOutRemovalFailureIsVisible() async {
     #expect(session.user == githubTestUser)
     #expect(credentials.saves.isEmpty)
     credentials.removalError = GitHubCredentialError(operation: "remove", status: -50)
-    session.signOut()
+    await session.signOut()
     #expect(session.user == githubTestUser)
     #expect(session.errorMessage?.contains("remove") == true)
     #expect(credentials.token == githubTestToken)
     credentials.removalError = nil
-    session.signOut()
+    await session.signOut()
     #expect(session.user == nil)
     #expect(credentials.token == nil)
     #expect(session.errorMessage == nil)
@@ -298,7 +311,18 @@ func githubRotatedTokenSurvivesCredentialSaveFailure() async throws {
         Issue.record("Expected persistence failure")
     } catch { #expect(error is GitHubCredentialError) }
     #expect(session.user == githubTestUser)
+    for _ in 0..<5 {
+        do {
+            _ = try await session.authorized { $0 }
+            Issue.record("Expected latched credential failure")
+        } catch { #expect(error is GitHubCredentialError) }
+    }
+    #expect(credentials.saveAttempts == 1)
+    #expect(session.credentialAccessFailed)
     credentials.saveError = nil
+    await session.retryCredentialAccess()
+    #expect(!session.credentialAccessFailed)
+    #expect(credentials.saveAttempts == 2)
     #expect(try await session.authorized { $0 } == githubRenewedToken.accessToken)
     #expect(credentials.token == githubRenewedToken)
     #expect(await refreshes.values == [githubTestToken.accessToken])
@@ -313,11 +337,15 @@ func githubSignOutBlocksLateRefreshAndRestore() async {
     let session = testGitHubSession(credentials: credentials, refresh: { _ in await gate.enter() })
     let restore = Task { await session.restore() }
     await gate.waitForEntry()
-    session.signOut()
+    let signOut = Task { await session.signOut() }
+    for await signingOut in Observations({ session.isSigningOut }) {
+        if signingOut { break }
+    }
     await gate.release(githubRenewedToken) // Deliberately ignores cancellation.
+    await signOut.value
     await restore.value
     #expect(session.user == nil)
-    #expect(credentials.saves.isEmpty)
+    #expect(credentials.saves == [githubRenewedToken])
     #expect(credentials.token == nil)
     #expect(!session.isRestoring)
 }
@@ -338,4 +366,157 @@ func githubExpiredRefreshTokenCannotBeUsed() async {
     #expect(credentials.token == nil)
     #expect(session.user == nil)
     #expect(session.errorMessage != nil)
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func githubReadDenialRestoresOnlyOnceUntilExplicitRetry() async {
+    let credentials = TestGitHubCredentials(githubTestToken)
+    credentials.loadError = GitHubCredentialError(operation: "read", status: -128)
+    let gate = GitHubTestGate<Void>()
+    credentials.loadGate = gate
+    let session = testGitHubSession(credentials: credentials)
+    let first = Task { await session.restoreIfNeeded() }
+    await gate.waitForEntry()
+    await session.restoreIfNeeded()
+    #expect(credentials.loads == 1)
+    await gate.release(())
+    await first.value
+    await session.restoreIfNeeded()
+    #expect(credentials.loads == 1)
+    #expect(session.errorMessage?.contains("read") == true)
+    #expect(credentials.removals == 0)
+    #expect(credentials.token == githubTestToken)
+    await #expect(throws: GitHubCredentialError.self) {
+        _ = try await session.authorized { $0 }
+    }
+    await session.restore()
+    #expect(credentials.loads == 1)
+    #expect(credentials.removals == 0)
+    credentials.loadGate = nil
+    credentials.loadError = nil
+    await session.retryCredentialAccess()
+    #expect(credentials.loads == 2)
+    #expect(session.user == githubTestUser)
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func githubSignOutOrdersRemovalAfterAlreadySubmittedSave() async {
+    let credentials = TestGitHubCredentials(githubTestToken)
+    let session = testGitHubSession(credentials: credentials, refresh: { _ in githubRenewedToken })
+    await session.restore()
+    let gate = GitHubTestGate<Void>()
+    credentials.saveGate = gate
+    let request = Task {
+        try await session.authorized { token in
+            if token == githubTestToken.accessToken { throw GitHubAPIError.unauthorized }
+            return token
+        }
+    }
+    await gate.waitForEntry()
+    let signOut = Task { await session.signOut() }
+    while !session.isSigningOut { await Task.yield() }
+    #expect(credentials.removals == 0)
+    session.beginSignIn()
+    #expect(!session.isSigningIn)
+    await gate.release(())
+    await signOut.value
+    await #expect(throws: CancellationError.self) { _ = try await request.value }
+    #expect(credentials.saves == [githubRenewedToken])
+    #expect(credentials.removals == 1)
+    #expect(credentials.token == nil)
+    #expect(session.user == nil)
+    #expect(!session.isSigningOut)
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func githubRefusedSignOutKeepsAnInFlightRotatedToken() async throws {
+    let credentials = TestGitHubCredentials(githubTestToken)
+    let gate = GitHubTestGate<GitHubToken>()
+    let refreshes = GitHubTestCalls()
+    let session = testGitHubSession(credentials: credentials, refresh: { token in
+        await refreshes.record(token.accessToken)
+        return await gate.enter()
+    })
+    await session.restore()
+    let request = Task {
+        try await session.authorized { token in
+            if token == githubTestToken.accessToken { throw GitHubAPIError.unauthorized }
+            return token
+        }
+    }
+    await gate.waitForEntry()
+    credentials.removalError = GitHubCredentialError(operation: "remove", status: -128)
+    let signOut = Task { await session.signOut() }
+    for await signingOut in Observations({ session.isSigningOut }) {
+        if signingOut { break }
+    }
+    #expect(credentials.removals == 0)
+    await gate.release(githubRenewedToken)
+    await signOut.value
+    await #expect(throws: CancellationError.self) { _ = try await request.value }
+    #expect(session.user == githubTestUser)
+    #expect(session.errorMessage != nil)
+    #expect(credentials.token == githubRenewedToken)
+    #expect(try await session.authorized { $0 } == githubRenewedToken.accessToken)
+    #expect(await refreshes.values == [githubTestToken.accessToken])
+    credentials.removalError = nil
+    await session.signOut()
+    #expect(session.user == nil)
+    #expect(credentials.token == nil)
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func githubSignOutPreventsLateUnauthorizedRequestsStartingAnotherRotation() async {
+    let credentials = TestGitHubCredentials(githubTestToken)
+    let rotation = GitHubTestGate<GitHubToken>()
+    let response = GitHubTestGate<Void>()
+    let refreshes = GitHubTestCalls()
+    let session = testGitHubSession(credentials: credentials, refresh: { token in
+        await refreshes.record(token.accessToken)
+        return await rotation.enter()
+    })
+    await session.restore()
+    let lateRequest = Task {
+        try await session.authorized { _ -> String in
+            await response.enter()
+            throw GitHubAPIError.unauthorized
+        }
+    }
+    await response.waitForEntry()
+    let refreshingRequest = Task {
+        try await session.authorized { token in
+            if token == githubTestToken.accessToken { throw GitHubAPIError.unauthorized }
+            return token
+        }
+    }
+    await rotation.waitForEntry()
+    let signOut = Task { await session.signOut() }
+    for await signingOut in Observations({ session.isSigningOut }) {
+        if signingOut { break }
+    }
+    await response.release(())
+    await #expect(throws: CancellationError.self) { _ = try await lateRequest.value }
+    await rotation.release(githubRenewedToken)
+    await signOut.value
+    await #expect(throws: CancellationError.self) { _ = try await refreshingRequest.value }
+    #expect(await refreshes.values == [githubTestToken.accessToken])
+    #expect(credentials.token == nil)
+    #expect(session.user == nil)
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func githubSignOutRejectsLateCredentialRead() async {
+    let credentials = TestGitHubCredentials(githubTestToken)
+    let gate = GitHubTestGate<Void>()
+    credentials.loadGate = gate
+    let session = testGitHubSession(credentials: credentials)
+    let restore = Task { await session.restoreIfNeeded() }
+    await gate.waitForEntry()
+    await session.signOut()
+    await gate.release(())
+    await restore.value
+    #expect(session.user == nil)
+    #expect(credentials.token == nil)
+    #expect(credentials.saves.isEmpty)
+    #expect(!session.isRestoring)
 }

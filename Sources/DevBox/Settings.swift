@@ -22,15 +22,59 @@ protocol SettingsPersisting {
 
 @MainActor
 protocol CredentialsPersisting {
+    func password(for id: UUID) async throws -> String?
+    func save(password: String, for id: UUID) async throws
+    func remove(for id: UUID) async throws
+}
+
+final class KeychainCredentials: CredentialsPersisting {
+    private let backend: any PasswordCredentialBackend
+    private var reads: [UUID: Task<String?, Error>] = [:]
+
+    init(backend: any PasswordCredentialBackend = CredentialStore()) {
+        self.backend = backend
+    }
+
+    func password(for id: UUID) async throws -> String? {
+        if let read = reads[id] { return try await read.value }
+        let backend = backend
+        let read = Task { try await KeychainExecutor.shared.run { try backend.password(for: id) } }
+        reads[id] = read
+        defer { reads[id] = nil }
+        return try await read.value
+    }
+
+    func save(password: String, for id: UUID) async throws {
+        let backend = backend
+        try await KeychainExecutor.shared.run { try backend.save(password: password, for: id) }
+    }
+
+    func remove(for id: UUID) async throws {
+        let backend = backend
+        try await KeychainExecutor.shared.run { try backend.remove(for: id) }
+    }
+}
+
+/// Synchronous implementations are invoked only on the dedicated Keychain queue.
+protocol PasswordCredentialBackend: Sendable {
     func password(for id: UUID) throws -> String?
     func save(password: String, for id: UUID) throws
     func remove(for id: UUID) throws
 }
 
-struct KeychainCredentials: CredentialsPersisting {
-    func password(for id: UUID) throws -> String? { try CredentialStore.password(for: id) }
-    func save(password: String, for id: UUID) throws { try CredentialStore.save(password: password, for: id) }
-    func remove(for id: UUID) throws { try CredentialStore.remove(for: id) }
+/// Security may block on user authorization. Never occupy the main thread or a
+/// cooperative Swift worker while waiting, and never share the disk/Git queue.
+final class KeychainExecutor: Sendable {
+    static let shared = KeychainExecutor()
+    private let queue = DispatchQueue(label: "app.devbox.keychain", qos: .userInitiated)
+
+    func run<Value: Sendable>(_ operation: @escaping @Sendable () throws -> Value) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                continuation.resume(with: Result { try operation() })
+            }
+        }
+    }
 }
 
 struct SettingsStore: SettingsPersisting {
@@ -60,7 +104,7 @@ struct SettingsStore: SettingsPersisting {
     }
 }
 
-enum CredentialStore {
+struct CredentialStore: PasswordCredentialBackend {
     private static let service = "app.devbox.mariadb"
 
     private static func query(_ id: UUID) -> [String: Any] {
@@ -71,8 +115,8 @@ enum CredentialStore {
         ]
     }
 
-    static func password(for id: UUID) throws -> String? {
-        var query = query(id)
+    func password(for id: UUID) throws -> String? {
+        var query = Self.query(id)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
@@ -85,9 +129,9 @@ enum CredentialStore {
         return password
     }
 
-    static func save(password: String, for id: UUID) throws {
+    func save(password: String, for id: UUID) throws {
         let data = Data(password.utf8)
-        let query = query(id)
+        let query = Self.query(id)
         let update = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if update == errSecItemNotFound {
             var item = query
@@ -100,8 +144,8 @@ enum CredentialStore {
         }
     }
 
-    static func remove(for id: UUID) throws {
-        let status = SecItemDelete(query(id) as CFDictionary)
+    func remove(for id: UUID) throws {
+        let status = SecItemDelete(Self.query(id) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError(status: status)
         }

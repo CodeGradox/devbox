@@ -316,13 +316,13 @@ func changingProjectsDuringFetchDoesNotPublishObsoleteResults() async throws {
     await waitForBranchLoad(store)
     let b = try #require(store.selectedProjectSession?.branchList)
     await probe.release()
-    // A canceled fetch may finish its subprocess, but must not label the next
-    // project's inventory as freshly fetched or replace its current session.
+    // Fetch mutates refs: navigation lets it finish in its original session,
+    // without labeling the next project's inventory as freshly fetched.
     store.destination = .project("/test/a/.git")
     await waitForBranchLoad(store)
     #expect(store.selectedProjectSession?.branchList === a)
     #expect(a.hasLoadedInventory)
-    #expect(a.lastFetchedAt == nil)
+    #expect(a.lastFetchedAt != nil)
     #expect(b.hasLoadedInventory)
     #expect(b.lastFetchedAt == nil)
     #expect(await operations.counts().lists == 3)

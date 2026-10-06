@@ -25,18 +25,106 @@ private final class MemorySettings: SettingsPersisting {
 private final class MemoryCredentials: CredentialsPersisting {
     var values: [UUID: String] = [:]
     var writes = 0
-    func password(for id: UUID) throws -> String? { values[id] }
-    func save(password: String, for id: UUID) throws {
+    var readError: Error?
+    var removeError: Error?
+    var saveGate: GitHubTestGate<Void>?
+    func password(for id: UUID) throws -> String? {
+        if let readError { throw readError }
+        return values[id]
+    }
+    func save(password: String, for id: UUID) async throws {
         writes += 1
+        if let gate = saveGate {
+            saveGate = nil
+            await gate.enter()
+        }
         values[id] = password
     }
-    func remove(for id: UUID) throws { values.removeValue(forKey: id) }
+    func remove(for id: UUID) throws {
+        if let removeError { throw removeError }
+        values.removeValue(forKey: id)
+    }
 }
 
 private enum TestFailure: Error { case expected }
 
+@Test(.timeLimit(.minutes(1))) @MainActor
+func connectionSaveMergesConcurrentSettingsAndRejectsOverlappingCredentialEdits() async throws {
+    let persistence = MemorySettings()
+    let credentials = MemoryCredentials()
+    let project = ProjectRecord(id: "unrelated", name: "Unrelated", path: "/unused")
+    persistence.value.projects = [project]
+    let original = SavedConnection(name: "Original", settings: .init())
+    persistence.value.connections = [original]
+    credentials.values[original.id] = "synthetic-old"
+    let gate = GitHubTestGate<Void>()
+    credentials.saveGate = gate
+    let store = AppStore(persistence: persistence, credentials: credentials,
+                         listDatabases: { _, _ in [] }, loadStatistics: { _, _ in [:] },
+                         editorLauncher: inertEditorLauncher())
+    var changed = original
+    changed.name = "Changed"
+    let save = Task { try await store.saveConnection(changed, password: "synthetic-new") }
+    await gate.waitForEntry()
+    store.forgetProject(project)
+    await #expect(throws: (any Error).self) {
+        try await store.saveConnection(original, password: "overlapping")
+    }
+    await store.forgetConnection(original)
+    #expect(store.settings.connections == [original])
+    await gate.release(())
+    try await save.value
+    #expect(store.settings.projects.isEmpty)
+    #expect(persistence.value.projects.isEmpty)
+    #expect(store.settings.connections == [changed])
+    #expect(persistence.value.connections == [changed])
+    #expect(credentials.values[original.id] == "synthetic-new")
+    #expect(credentials.writes == 1)
+}
+
 @Test @MainActor
-func failedSettingsWriteRestoresPreviousPassword() throws {
+func connectionReadDenialNeverBecomesMissingPasswordOrAllowsMutation() async {
+    let persistence = MemorySettings()
+    let credentials = MemoryCredentials()
+    let connection = SavedConnection(name: "Existing", settings: .init())
+    persistence.value.connections = [connection]
+    credentials.values[connection.id] = "synthetic-old"
+    credentials.readError = TestFailure.expected
+    let store = AppStore(persistence: persistence, credentials: credentials, editorLauncher: inertEditorLauncher())
+    await #expect(throws: TestFailure.self) { try await store.password(for: connection.id) }
+    await #expect(throws: TestFailure.self) {
+        try await store.saveConnection(connection, password: "synthetic-new")
+    }
+    await store.forgetConnection(connection)
+    #expect(store.settings.connections == [connection])
+    #expect(credentials.values[connection.id] == "synthetic-old")
+    #expect(persistence.writes == 0)
+    #expect(credentials.writes == 0)
+}
+
+@Test @MainActor
+func connectionRemovalPreservesSettingsOnKeychainFailureAndRestoresSecretOnSettingsFailure() async {
+    let persistence = MemorySettings()
+    let credentials = MemoryCredentials()
+    let connection = SavedConnection(name: "Existing", settings: .init())
+    persistence.value.connections = [connection]
+    credentials.values[connection.id] = "synthetic-old"
+    let store = AppStore(persistence: persistence, credentials: credentials, editorLauncher: inertEditorLauncher())
+    credentials.removeError = TestFailure.expected
+    await store.forgetConnection(connection)
+    #expect(store.settings.connections == [connection])
+    #expect(persistence.writes == 0)
+    credentials.removeError = nil
+    persistence.failWrite = true
+    await store.forgetConnection(connection)
+    #expect(store.settings.connections == [connection])
+    #expect(persistence.value.connections == [connection])
+    #expect(credentials.values[connection.id] == "synthetic-old")
+    #expect(store.errorMessage != nil)
+}
+
+@Test @MainActor
+func failedSettingsWriteRestoresPreviousPassword() async throws {
     let persistence = MemorySettings()
     let credentials = MemoryCredentials()
     let original = SavedConnection(name: "Original", settings: .init())
@@ -46,8 +134,8 @@ func failedSettingsWriteRestoresPreviousPassword() throws {
     let store = AppStore(persistence: persistence, credentials: credentials, editorLauncher: inertEditorLauncher())
     var updated = original
     updated.name = "Changed"
-    #expect(throws: TestFailure.self) {
-        try store.saveConnection(updated, password: "new test password")
+    await #expect(throws: TestFailure.self) {
+        try await store.saveConnection(updated, password: "new test password")
     }
     #expect(credentials.values[original.id] == "old test password")
     #expect(store.settings.connections == [original])
@@ -55,28 +143,28 @@ func failedSettingsWriteRestoresPreviousPassword() throws {
 }
 
 @Test @MainActor
-func failedNewConnectionWriteRemovesOrphanCredential() {
+func failedNewConnectionWriteRemovesOrphanCredential() async {
     let persistence = MemorySettings()
     let credentials = MemoryCredentials()
     persistence.failWrite = true
     let store = AppStore(persistence: persistence, credentials: credentials, editorLauncher: inertEditorLauncher())
     let connection = SavedConnection(name: "New", settings: .init())
-    #expect(throws: TestFailure.self) {
-        try store.saveConnection(connection, password: "test password")
+    await #expect(throws: TestFailure.self) {
+        try await store.saveConnection(connection, password: "test password")
     }
     #expect(credentials.values.isEmpty)
     #expect(store.settings.connections.isEmpty)
 }
 
 @Test @MainActor
-func unreadableSettingsAreNeverOverwritten() {
+func unreadableSettingsAreNeverOverwritten() async {
     let persistence = MemorySettings()
     let credentials = MemoryCredentials()
     persistence.failRead = true
     let store = AppStore(persistence: persistence, credentials: credentials, editorLauncher: inertEditorLauncher())
     #expect(store.errorMessage != nil)
-    #expect(throws: (any Error).self) {
-        try store.saveConnection(.init(name: "New", settings: .init()), password: "")
+    await #expect(throws: (any Error).self) {
+        try await store.saveConnection(.init(name: "New", settings: .init()), password: "")
     }
     #expect(persistence.writes == 0)
     #expect(credentials.writes == 0)
@@ -266,7 +354,7 @@ func openInEditorUsesRequestedWorktreeWithoutChangingSelectionOrBranches() async
 
     store.projectSection = .branches
     await waitForGitStatus(store)
-    #expect(store.worktreeSelection.isEmpty)
+    #expect(store.worktreeSelection == [main.id])
     #expect(!store.canOpenInEditor([linked.id]))
     await store.openInEditor([linked.id])
     #expect(openedPaths == [linked.worktree.path, main.worktree.path])

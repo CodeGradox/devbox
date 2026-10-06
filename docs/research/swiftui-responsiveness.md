@@ -24,6 +24,13 @@ prioritizes queued interactive Git reads, and limits background scans to two of
 the executor's four workers. See [worktree refresh measurements](worktree-refresh-performance.md)
 for the synthetic benchmark, safety tests, and sizing-throughput trade-off.
 
+For the later tab-switching and permission-prompt reports, see
+[tab switching, background jobs, and Keychain responsiveness](tab-switching-and-keychain-responsiveness.md).
+The follow-up separates job lifetime from tab visibility, moves synchronous
+Keychain calls off-main, and retains the active project's two pane hosts.
+[Cached tab UI measurements](cached-tab-ui-measurements.md) report the synthetic
+Release comparison, not complete presentation latency or an Instruments trace.
+
 The analysis below describes the pre-refactor design and its rationale.
 
 ## Bottom line

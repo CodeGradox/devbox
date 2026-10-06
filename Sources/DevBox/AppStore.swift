@@ -168,23 +168,30 @@ final class AppStore {
     var projectSection: ProjectSection = .worktrees {
         didSet {
             guard projectSection != oldValue else { return }
-            worktreeSelection = []
-            selectedProjectSession?.branchList.selection = []
-            loadSelection()
+            ensureProjectSectionLoaded()
         }
     }
     private(set) var selectedProjectSession: ProjectSessionState?
     private(set) var selectedDatabaseSession: DatabaseSessionState?
     var worktreeSelection: Set<String> = []
     var databaseSelection: Set<String> = []
-    private(set) var isRefreshing = false
+    private var databaseRefreshing = false
+    var isRefreshing: Bool { selectedProjectLoading?.isLoading ?? databaseRefreshing }
     private(set) var isDeleting = false
-    private(set) var progressText = ""
+    private var deletionProgressText = ""
+    private var databaseProgressText = ""
+    var progressText: String {
+        isDeleting ? deletionProgressText : (selectedProjectLoading?.progress ?? databaseProgressText)
+    }
     private(set) var editorApplications: [EditorApplication] = []
     private(set) var preferredEditor: EditorApplication?
     private(set) var isChoosingEditor = false
     var errorMessage: String?
-    private(set) var loadError: String?
+    private var databaseLoadError: String?
+    var loadError: String? {
+        if let selectedProjectLoading { return selectedProjectLoading.error }
+        return databaseLoadError
+    }
     private(set) var deletionError: String?
     private(set) var deletionEntries: [OperationResult.Entry] = []
     private(set) var deletionBatchID: UUID?
@@ -205,6 +212,7 @@ final class AppStore {
     private let removeWorktree: @Sendable (WorktreeRecord, ProjectRecord) async throws -> Void
     private let listDatabases: @Sendable (ConnectionSettings, String) async throws -> [DatabaseRecord]
     private let loadStatistics: @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics]
+    private let listWorktrees: @Sendable (ProjectRecord) async throws -> [WorktreeRecord]
     private let loadGitStatus: @Sendable (WorktreeRecord) async throws -> GitStatus
     private let editorLauncher: EditorLauncher
     private let chooseEditor: @MainActor () -> URL?
@@ -215,7 +223,7 @@ final class AppStore {
     private let fetchManagedBranches: @Sendable (ProjectRecord) async throws -> Void
     private let deleteBranch: @Sendable (ManagedBranch, ProjectRecord, Bool) async throws -> Void
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
-    @ObservationIgnored private var branchTask: Task<Void, Never>?
+    @ObservationIgnored private var pullRequestTask: Task<Void, Never>?
     @ObservationIgnored private var generation = UUID()
     @ObservationIgnored private var settingsReadable = true
     private var queuedSheet: AppSheet?
@@ -276,6 +284,9 @@ final class AppStore {
         loadStatistics: @escaping @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics] = {
             try await DatabaseService().databaseStatistics(settings: $0, password: $1)
         },
+        listWorktrees: @escaping @Sendable (ProjectRecord) async throws -> [WorktreeRecord] = {
+            try await GitService().listWorktrees(project: $0)
+        },
         loadGitStatus: @escaping @Sendable (WorktreeRecord) async throws -> GitStatus = {
             try await GitService().status(worktree: $0)
         },
@@ -298,6 +309,7 @@ final class AppStore {
         self.removeWorktree = removeWorktree
         self.listDatabases = listDatabases
         self.loadStatistics = loadStatistics
+        self.listWorktrees = listWorktrees
         self.loadGitStatus = loadGitStatus
         self.editorLauncher = editorLauncher
         self.chooseEditor = chooseEditor
@@ -325,6 +337,13 @@ final class AppStore {
         refreshEditorApplications()
     }
 
+    isolated deinit {
+        pullRequestTask?.cancel()
+        refreshTask?.cancel()
+        for session in projectSessions.values { session.cancelLoading() }
+        sizeQueue.cancelAll()
+    }
+
     var selectedProject: ProjectRecord? {
         guard case .project(let id) = destination else { return nil }
         return settings.projects.first { $0.id == id }
@@ -333,6 +352,11 @@ final class AppStore {
     var selectedConnection: SavedConnection? {
         guard case .connection(let id) = destination else { return nil }
         return settings.connections.first { $0.id == id }
+    }
+
+    private var selectedProjectLoading: ProjectLoadingState? {
+        guard let session = selectedProjectSession else { return nil }
+        return projectSection == .worktrees ? session.worktreeLoading : session.branchLoading
     }
 
     var selectedWorktrees: [WorktreeRow] {
@@ -448,7 +472,8 @@ final class AppStore {
     }
 
     var canDeleteSelection: Bool {
-        guard !isRefreshing, !isDeleting, !isModalPresented else { return false }
+        guard !isRefreshing, !isDeleting, !isModalPresented,
+              selectedProjectSession?.isFetchingBranches != true else { return false }
         if selectedProject != nil {
             if projectSection == .branches {
                 guard selectedProjectSession?.branchList.hasLoadedInventory == true else { return false }
@@ -497,28 +522,41 @@ final class AppStore {
         } catch { errorMessage = error.localizedDescription }
     }
 
-    func saveConnection(_ connection: SavedConnection, password: String) throws {
-        var next = settings
-        if let index = next.connections.firstIndex(where: { $0.id == connection.id }) {
-            next.connections[index] = connection
-        } else {
-            next.connections.append(connection)
+    @ObservationIgnored private var credentialEdits: Set<UUID> = []
+
+    private func beginCredentialEdit(_ id: UUID) throws {
+        guard credentialEdits.insert(id).inserted else {
+            throw NSError(domain: "DevBox.Keychain", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "This connection’s credentials are being updated. Try again when the update finishes."
+            ])
         }
+    }
+
+    func saveConnection(_ connection: SavedConnection, password: String) async throws {
         guard settingsReadable else { throw SettingsError.unreadable }
+        try beginCredentialEdit(connection.id)
+        defer { credentialEdits.remove(connection.id) }
         let existing = settings.connections.contains { $0.id == connection.id }
         // Preserve the old secret so a failed settings write cannot silently pair
         // old connection settings with a newly entered password.
-        let previousPassword = existing ? try credentials.password(for: connection.id) : nil
-        try credentials.save(password: password, for: connection.id)
+        let previousPassword = existing ? try await credentials.password(for: connection.id) : nil
+        try await credentials.save(password: password, for: connection.id)
         do {
+            // Merge only after suspension: unrelated settings edits must survive.
+            var next = settings
+            if let index = next.connections.firstIndex(where: { $0.id == connection.id }) {
+                next.connections[index] = connection
+            } else {
+                next.connections.append(connection)
+            }
             try persist(next)
         } catch {
             let settingsError = error
             do {
                 if let previousPassword {
-                    try credentials.save(password: previousPassword, for: connection.id)
+                    try await credentials.save(password: previousPassword, for: connection.id)
                 } else {
-                    try credentials.remove(for: connection.id)
+                    try await credentials.remove(for: connection.id)
                 }
             } catch {
                 throw NSError(
@@ -531,18 +569,38 @@ final class AppStore {
         }
         // A changed endpoint or credential must never reuse the old server's metadata.
         databaseSessions[connection.id] = DatabaseSessionState()
-        destination = .connection(connection.id)
-        refresh()
+        if destination == .connection(connection.id) {
+            loadSelection()
+        } else {
+            destination = .connection(connection.id)
+        }
     }
 
-    func forgetConnection(_ connection: SavedConnection) {
+    func forgetConnection(_ connection: SavedConnection) async {
         do {
+            guard settingsReadable else { throw SettingsError.unreadable }
+            try beginCredentialEdit(connection.id)
+            defer { credentialEdits.remove(connection.id) }
+            let previousPassword = try await credentials.password(for: connection.id)
+            try await credentials.remove(for: connection.id)
             var next = settings
             next.connections.removeAll { $0.id == connection.id }
-            try persist(next)
+            do {
+                try persist(next)
+            } catch {
+                let settingsError = error
+                if let previousPassword {
+                    do { try await credentials.save(password: previousPassword, for: connection.id) }
+                    catch {
+                        throw NSError(domain: "DevBox.Settings", code: 1, userInfo: [
+                            NSLocalizedDescriptionKey: "Settings could not be saved, and the previous Keychain password could not be restored. Re-enter the connection credentials before using it."
+                        ])
+                    }
+                }
+                throw settingsError
+            }
             databaseSessions.removeValue(forKey: connection.id)
             if destination == .connection(connection.id) { destination = nil }
-            try credentials.remove(for: connection.id)
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -558,8 +616,13 @@ final class AppStore {
         }
     }
 
-    func password(for connectionID: UUID) throws -> String {
-        guard let password = try credentials.password(for: connectionID) else {
+    func password(for connectionID: UUID) async throws -> String {
+        guard !credentialEdits.contains(connectionID) else {
+            throw NSError(domain: "DevBox.Keychain", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "This connection’s credentials are being updated. Try again when the update finishes."
+            ])
+        }
+        guard let password = try await credentials.password(for: connectionID) else {
             throw NSError(
                 domain: "DevBox.Keychain",
                 code: 1,
@@ -571,19 +634,53 @@ final class AppStore {
 
     /// Reuse this session's snapshot on selection. A new app instance has none.
     func loadSelection() {
-        refresh(useCache: true)
+        guard !isDeleting else { return }
+        refreshTask?.cancel()
+        refreshTask = nil
+        selectedProjectSession?.cancelLoading(preservingFetch: true)
+        selectedDatabaseSession?.pauseStatistics()
+        sizeQueue.cancelAll()
+        pullRequestTask?.cancel()
+        pullRequestTask = nil
+        github.pullRequests.cancelLoading()
+        generation = UUID()
+        databaseRefreshing = false
+        databaseProgressText = ""
+        databaseLoadError = nil
+        selectedProjectSession = selectedProject.flatMap { projectSessions[$0.id] }
+        selectedDatabaseSession = selectedConnection.flatMap { databaseSessions[$0.id] }
+        if selectedProject != nil {
+            ensureProjectSectionLoaded()
+        } else if let connection = selectedConnection, let session = selectedDatabaseSession {
+            loadDatabase(connection, session: session, useCache: true)
+        }
     }
 
     /// Explicit refresh reloads inventory and measurements; deletion only updates the cache.
     func refresh() {
-        refresh(useCache: false)
+        guard !isDeleting else { return }
+        if let project = selectedProject, let session = selectedProjectSession {
+            if projectSection == .branches {
+                guard !session.isFetchingBranches else { return }
+                loadBranchList(project, session: session, useCache: false)
+            } else {
+                sizeQueue.cancelAll()
+                session.worktreeLoading.cancel()
+                session.inspectionLoading.cancel()
+                session.pauseScans()
+                loadWorktrees(project, session: session, useCache: false)
+            }
+        } else if let connection = selectedConnection, let session = selectedDatabaseSession {
+            loadDatabase(connection, session: session, useCache: false)
+        }
     }
 
     /// Network access is explicit; ordinary Refresh only rereads local refs.
     func fetchBranches() {
         guard selectedProject != nil, projectSection == .branches,
               !isRefreshing, !isDeleting, !isModalPresented else { return }
-        refresh(useCache: false, fetchRemotes: true)
+        guard let project = selectedProject, let session = selectedProjectSession else { return }
+        loadBranchList(project, session: session, useCache: false, fetchRemotes: true)
     }
 
     func changeMergeTarget(_ reference: String?) {
@@ -599,167 +696,215 @@ final class AppStore {
                 id: project.id, name: project.name, path: project.path, mergeTarget: reference
             )
             try persist(next)
-            projectSessions[project.id]?.updateOverview {
+            guard let session = projectSessions[project.id],
+                  let updatedProject = selectedProject else { return }
+            session.inspectionLoading.cancel()
+            session.updateOverview {
                 $0.branches = nil
                 $0.branchError = nil
-                $0.isLoadingBranches = true
+                $0.isLoadingBranches = false
             }
-            projectSessions[project.id]?.branchList.invalidateInventory()
-            loadSelection()
+            session.invalidateBranchInventory()
+            loadProjectOverview(updatedProject, session: session)
         } catch { errorMessage = error.localizedDescription }
     }
 
-    private func refresh(useCache: Bool, fetchRemotes: Bool = false) {
-        guard !isDeleting else { return }
+    /// Tabs express demand; the project session, not a view, owns ongoing jobs.
+    private func ensureProjectSectionLoaded() {
+        guard !isDeleting, let project = selectedProject, let session = selectedProjectSession else { return }
+        if projectSection == .branches {
+            observePullRequestDemand(session)
+            loadBranchList(project, session: session, useCache: true)
+        } else {
+            loadWorktrees(project, session: session, useCache: true)
+        }
+    }
+
+    private struct PullRequestDemand: Equatable {
+        let account: UUID
+        let branches: Set<GitHubBranch>
+        let ready: Bool
+    }
+
+    private func observePullRequestDemand(_ session: ProjectSessionState) {
+        guard pullRequestTask == nil else { return }
+        let github = github
+        pullRequestTask = Task {
+            var previous: PullRequestDemand?
+            for await demand in Observations({
+                PullRequestDemand(
+                    account: github.accountGeneration,
+                    branches: session.branchList.visibleGitHubBranches,
+                    ready: session.branchList.hasLoadedInventory && !github.isSigningOut
+                )
+            }) {
+                guard !Task.isCancelled else { return }
+                guard demand.ready, previous != demand else { continue }
+                previous = demand
+                github.pullRequests.load(demand.branches, session: github)
+            }
+        }
+    }
+
+    private func loadDatabase(_ connection: SavedConnection, session: DatabaseSessionState, useCache: Bool) {
         refreshTask?.cancel()
-        branchTask?.cancel()
-        sizeQueue.cancelAll()
-        selectedProjectSession?.pauseScans()
-        selectedDatabaseSession?.pauseStatistics()
+        session.pauseStatistics()
         let token = UUID()
         generation = token
-        loadError = nil
-        progressText = ""
-        let project = selectedProject
-        let connection = selectedConnection
-        let session = project.flatMap { projectSessions[$0.id] }
-        if selectedProjectSession !== session { selectedProjectSession = session }
-        let databaseSession = connection.flatMap { databaseSessions[$0.id] }
-        if selectedDatabaseSession !== databaseSession { selectedDatabaseSession = databaseSession }
-        guard destination != nil else {
-            isRefreshing = false
-            return
-        }
-        if let project, let session, projectSection == .branches {
-            loadBranchList(project, session: session, useCache: useCache, fetchRemotes: fetchRemotes, token: token)
-            return
-        }
-        if useCache, let connection, let databaseSession, databaseSession.hasLoadedInventory {
-            isRefreshing = false
-            guard databaseSession.needsStatisticsLoad else {
+        databaseLoadError = nil
+        databaseProgressText = ""
+        if useCache, session.hasLoadedInventory {
+            databaseRefreshing = false
+            guard session.needsStatisticsLoad else {
                 refreshTask = nil
                 return
             }
             refreshTask = Task {
                 guard generation == token, !Task.isCancelled else { return }
                 do {
-                    let secret = try password(for: connection.id)
-                    await loadDatabaseStatistics(connection, session: databaseSession, password: secret, token: token)
+                    let secret = try await password(for: connection.id)
+                    guard generation == token, !Task.isCancelled else { return }
+                    await loadDatabaseStatistics(connection, session: session, password: secret, token: token)
                 } catch {
                     guard generation == token, !Task.isCancelled else { return }
-                    databaseSession.failStatistics(error.localizedDescription)
+                    session.failStatistics(error.localizedDescription)
                 }
             }
             return
         }
-        if useCache, let session, session.hasLoadedInventory {
-            let cachedRows = session.snapshots
-            session.performBatchUpdates {
-                for row in cachedRows {
-                    updateRow(row.id) { $0.sizeState = .idle }
-                }
-                if let project { loadProjectOverview(project, token: token) }
-                for row in cachedRows where row.needsSizeLoad {
-                    enqueueSizeScan(row.worktree, token: token)
-                }
-            }
-            worktreeSelection.formIntersection(Set(session.rows.map(\.id)))
-            let missingStatuses = cachedRows.filter(\.needsStatusLoad).map(\.worktree)
-            isRefreshing = !missingStatuses.isEmpty
-            guard !missingStatuses.isEmpty else {
-                refreshTask = nil
-                return
-            }
-            progressText = "Loading remaining Git status…"
-            refreshTask = Task {
-                defer { finishRefresh(token: token) }
-                await loadGitStatuses(missingStatuses, token: token)
-            }
-            return
-        }
-        // Preserve current content and identities while the new inventory loads.
-        // A failed load invalidates reuse but doesn't destroy the visible snapshot.
-        session?.invalidateInventory()
-        databaseSession?.invalidateInventory()
-        isRefreshing = true
-        progressText = "Refreshing…"
+        session.invalidateInventory()
+        databaseRefreshing = true
+        databaseProgressText = "Refreshing…"
         refreshTask = Task {
             defer { finishRefresh(token: token) }
             guard generation == token, !Task.isCancelled else { return }
             do {
-                if let project, let session {
-                    let records = try await git.listWorktrees(project: project)
-                    guard generation == token, !Task.isCancelled else { return }
-                    session.performBatchUpdates {
-                        session.reconcile(records, refresh: true)
-                        session.branchList.invalidateInventory()
-                        // Reset load state but retain last successful measurements
-                        // until replaced. Rows remain displayed during refresh.
-                        session.updateOverview {
-                            $0.branches = nil
-                            $0.branchError = nil
-                            $0.isLoadingBranches = true
-                            $0.gitUsageError = nil
-                            $0.gitRefreshPending = true
-                        }
-                        worktreeSelection.formIntersection(Set(records.map(\.id)))
-                        loadProjectOverview(project, token: token)
-                        for record in records where record.exists && !record.isBare {
-                            enqueueSizeScan(record, token: token)
-                        }
-                    }
-                    progressText = "Refreshing Git status…"
-                    await loadGitStatuses(records, token: token)
-                } else if let connection, let databaseSession {
-                    let password = try password(for: connection.id)
-                    let records = try await listDatabases(connection.settings, password)
-                    guard generation == token, !Task.isCancelled else { return }
-                    databaseSession.reconcile(records)
-                    databaseSelection.formIntersection(Set(records.map(\.id)))
-                    // The inventory is usable immediately; slow metadata does not hide
-                    // the table or block selection/deletion behind a connecting overlay.
-                    finishRefresh(token: token)
-                    await loadDatabaseStatistics(connection, session: databaseSession, password: password, token: token)
-                }
+                let password = try await password(for: connection.id)
+                guard generation == token, !Task.isCancelled else { return }
+                let records = try await listDatabases(connection.settings, password)
+                guard generation == token, !Task.isCancelled else { return }
+                session.reconcile(records)
+                databaseSelection.formIntersection(Set(records.map(\.id)))
+                finishRefresh(token: token)
+                await loadDatabaseStatistics(connection, session: session, password: password, token: token)
             } catch {
                 guard generation == token, !Task.isCancelled else { return }
-                loadError = error.localizedDescription
-                databaseSession?.failStatistics(
-                    "The database list could not be refreshed. \(error.localizedDescription)"
-                )
+                databaseLoadError = error.localizedDescription
+                session.failStatistics("The database list could not be refreshed. \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func loadWorktrees(_ project: ProjectRecord, session: ProjectSessionState, useCache: Bool) {
+        let loading = session.worktreeLoading
+        if useCache, loading.isLoading { return }
+        if useCache, session.hasLoadedInventory {
+            let cachedRows = session.snapshots
+            let missingStatuses = cachedRows.filter(\.needsStatusLoad).map(\.worktree)
+            let token = missingStatuses.isEmpty ? loading.revision : loading.begin("Loading remaining Git status…")
+            session.performBatchUpdates {
+                loadProjectOverview(project, session: session)
+                for row in cachedRows where row.needsSizeLoad && !row.isSizeBusy {
+                    enqueueSizeScan(row.worktree, session: session, token: token)
+                }
+            }
+            worktreeSelection.formIntersection(Set(session.rows.map(\.id)))
+            guard !missingStatuses.isEmpty else { return }
+            loading.task = Task {
+                defer { loading.finish(token) }
+                await loadGitStatuses(missingStatuses, session: session, token: token)
+            }
+            return
+        }
+        session.invalidateInventory()
+        let token = loading.begin("Refreshing…")
+        loading.task = Task {
+            defer { loading.finish(token) }
+            guard loading.accepts(token), !Task.isCancelled else { return }
+            do {
+                let records = try await listWorktrees(project)
+                guard loading.accepts(token), !Task.isCancelled else { return }
+                let currentProject = settings.projects.first { $0.id == project.id } ?? project
+                // Both the worktree inventory and merge target are inspection
+                // inputs. Fence an inspection started before this reconciliation.
+                session.inspectionLoading.cancel()
+                session.performBatchUpdates {
+                    session.reconcile(records, refresh: true)
+                    session.invalidateBranchInventory()
+                    session.updateOverview {
+                        $0.branches = nil
+                        $0.branchError = nil
+                        $0.isLoadingBranches = false
+                        $0.gitUsageError = nil
+                        $0.gitRefreshPending = true
+                    }
+                    worktreeSelection.formIntersection(Set(records.map(\.id)))
+                    loadProjectOverview(currentProject, session: session)
+                    for record in records where record.exists && !record.isBare {
+                        enqueueSizeScan(record, session: session, token: token)
+                    }
+                }
+                // A hidden worktree refresh may invalidate the visible branch list.
+                // Let an existing branch operation finish its own verification.
+                if selectedProjectSession === session, projectSection == .branches {
+                    loadBranchList(project, session: session, useCache: true)
+                }
+                loading.progress = "Refreshing Git status…"
+                await loadGitStatuses(records, session: session, token: token)
+            } catch {
+                guard loading.accepts(token), !Task.isCancelled else { return }
+                loading.error = error.localizedDescription
             }
         }
     }
 
     private func loadBranchList(
-        _ project: ProjectRecord, session: ProjectSessionState, useCache: Bool, fetchRemotes: Bool, token: UUID
+        _ project: ProjectRecord, session: ProjectSessionState, useCache: Bool, fetchRemotes: Bool = false
     ) {
         let list = session.branchList
-        if useCache && list.hasLoadedInventory {
-            isRefreshing = false
-            refreshTask = nil
-            return
-        }
+        let loading = session.branchLoading
+        if useCache && (list.hasLoadedInventory || loading.isLoading) { return }
         list.invalidateInventory()
-        isRefreshing = true
-        progressText = fetchRemotes ? "Fetching and pruning remote branches…" : "Loading branches…"
-        refreshTask = Task {
-            defer { finishRefresh(token: token) }
-            guard generation == token, !Task.isCancelled else { return }
+        let token = loading.begin(fetchRemotes ? "Fetching and pruning remote branches…" : "Loading branches…")
+        session.isFetchingBranches = fetchRemotes
+        loading.task = Task {
+            defer {
+                if loading.accepts(token) {
+                    session.isFetchingBranches = false
+                    loading.finish(token)
+                    // Fetch may partially update refs even when it fails.
+                    if fetchRemotes, selectedProjectSession === session, projectSection == .worktrees {
+                        loadProjectOverview(selectedProject ?? project, session: session)
+                    }
+                }
+            }
+            guard loading.accepts(token), !Task.isCancelled else { return }
             do {
                 if fetchRemotes {
                     // Even a failed fetch may update some refs. Don't reuse merge badges.
-                    session.updateOverview { $0.branches = nil; $0.branchError = nil }
+                    session.inspectionLoading.cancel()
+                    session.updateOverview {
+                        $0.branches = nil; $0.branchError = nil; $0.isLoadingBranches = false
+                    }
                     try await fetchManagedBranches(project)
-                    guard generation == token, !Task.isCancelled else { return }
+                    guard loading.accepts(token), !Task.isCancelled else { return }
                     list.lastFetchedAt = Date()
                 }
-                let records = try await listManagedBranches(project)
-                guard generation == token, !Task.isCancelled else { return }
-                list.reconcile(records)
+                // Worktree reconciliation may invalidate protection information
+                // during this read. Reverify that snapshot, without repeating a
+                // Fetch & Prune or canceling the other tab's jobs.
+                while loading.accepts(token), !Task.isCancelled {
+                    let inventoryRevision = session.branchInventoryRevision
+                    let snapshotProject = settings.projects.first { $0.id == project.id } ?? project
+                    let records = try await listManagedBranches(snapshotProject)
+                    guard loading.accepts(token), !Task.isCancelled else { return }
+                    guard inventoryRevision == session.branchInventoryRevision else { continue }
+                    list.reconcile(records)
+                    break
+                }
             } catch {
-                guard generation == token, !Task.isCancelled else { return }
-                loadError = error.localizedDescription
+                guard loading.accepts(token), !Task.isCancelled else { return }
+                loading.error = error.localizedDescription
             }
         }
     }
@@ -781,21 +926,23 @@ final class AppStore {
 
     private func finishRefresh(token: UUID) {
         guard generation == token else { return }
-        isRefreshing = false
-        // Metadata may finish while a deletion is active; it does not own that progress.
-        if !isDeleting { progressText = "" }
+        databaseRefreshing = false
+        databaseProgressText = ""
     }
 
-    private func loadGitStatuses(_ records: [WorktreeRecord], token: UUID) async {
+    private func loadGitStatuses(
+        _ records: [WorktreeRecord], session: ProjectSessionState, token: UUID
+    ) async {
         let load = loadGitStatus
+        let loading = session.worktreeLoading
         await withTaskGroup(of: (String, Result<GitStatus, Error>).self) { group in
             var remaining = records.lazy.filter { $0.exists && !$0.isBare }.makeIterator()
             var inFlight = 0
             // Keep only two child tasks alive, replenishing after each published
             // result. The shared I/O executor separately bounds global workers.
-            while generation == token, !Task.isCancelled {
+            while loading.accepts(token), !Task.isCancelled {
                 while inFlight < 2, let record = remaining.next() {
-                    guard generation == token, !Task.isCancelled else {
+                    guard loading.accepts(token), !Task.isCancelled else {
                         group.cancelAll()
                         return
                     }
@@ -812,8 +959,8 @@ final class AppStore {
                 }
                 guard let (id, result) = await group.next() else { return }
                 inFlight -= 1
-                guard generation == token, !Task.isCancelled else { break }
-                updateRow(id) {
+                guard loading.accepts(token), !Task.isCancelled else { break }
+                session.updateRow(id) {
                     switch result {
                     case .success(let status):
                         $0.status = status
@@ -835,22 +982,23 @@ final class AppStore {
     }
 
     func refreshWorktreeSize(_ id: String) {
-        guard let row = selectedProjectSession?.row(id: id)?.row, canRefreshSize(row) else { return }
-        enqueueSizeScan(row.worktree, token: generation)
+        guard let session = selectedProjectSession,
+              let row = session.row(id: id)?.row, canRefreshSize(row) else { return }
+        enqueueSizeScan(row.worktree, session: session, token: session.worktreeLoading.revision)
     }
 
-    private func enqueueSizeScan(_ worktree: WorktreeRecord, token: UUID) {
-        updateRow(worktree.id) {
+    private func enqueueSizeScan(_ worktree: WorktreeRecord, session: ProjectSessionState, token: UUID) {
+        session.updateRow(worktree.id) {
             $0.sizeState = .queued
             $0.sizeRefreshPending = true
             $0.usageError = nil
         }
-        sizeQueue.enqueue(worktree, onStarted: { [weak self] in
-            guard let self, generation == token else { return }
-            updateRow(worktree.id) { $0.sizeState = .scanning }
-        }, onFinished: { [weak self] result in
-            guard let self, generation == token else { return }
-            updateRow(worktree.id) { row in
+        sizeQueue.enqueue(worktree, onStarted: { [weak session] in
+            guard let session, session.worktreeLoading.accepts(token) else { return }
+            session.updateRow(worktree.id) { $0.sizeState = .scanning }
+        }, onFinished: { [weak session] result in
+            guard let session, session.worktreeLoading.accepts(token) else { return }
+            session.updateRow(worktree.id) { row in
                 row.sizeState = .idle
                 row.sizeRefreshPending = false
                 switch result {
@@ -870,44 +1018,44 @@ final class AppStore {
         selectedProjectSession?.updateRow(id, update)
     }
 
-    private func updateOverview(_ update: (inout ProjectOverview) -> Void) {
-        selectedProjectSession?.updateOverview(update)
-    }
-
-    private func loadProjectOverview(_ project: ProjectRecord, token: UUID) {
-        if projectOverview.needsBranchLoad {
-            let records = worktrees.map(\.worktree)
-            updateOverview { $0.isLoadingBranches = true }
-            branchTask = Task {
+    private func loadProjectOverview(_ project: ProjectRecord, session: ProjectSessionState) {
+        let loading = session.inspectionLoading
+        if session.overview.needsBranchLoad, !loading.isLoading, !session.isFetchingBranches {
+            let records = session.snapshots.map(\.worktree)
+            let token = loading.begin()
+            session.updateOverview { $0.isLoadingBranches = true }
+            loading.task = Task {
+                defer { loading.finish(token) }
                 do {
                     let inspection = try await inspectBranches(project, records)
-                    guard generation == token, !Task.isCancelled else { return }
-                    updateOverview {
+                    guard loading.accepts(token), !Task.isCancelled else { return }
+                    session.updateOverview {
                         $0.branches = inspection
                         $0.branchError = nil
                         $0.isLoadingBranches = false
                     }
                 } catch {
-                    guard generation == token, !Task.isCancelled else { return }
-                    updateOverview {
+                    guard loading.accepts(token), !Task.isCancelled else { return }
+                    session.updateOverview {
                         $0.branchError = error.localizedDescription
                         $0.isLoadingBranches = false
                     }
                 }
             }
         }
-        if projectOverview.needsGitSizeLoad {
-            updateOverview {
+        if session.overview.needsGitSizeLoad, session.overview.gitSizeState == .idle {
+            let token = session.worktreeLoading.revision
+            session.updateOverview {
                 $0.gitSizeState = .queued
                 $0.gitRefreshPending = true
                 $0.gitUsageError = nil
             }
-            sizeQueue.enqueueGitStorage(project, onStarted: { [weak self] in
-                guard let self, generation == token else { return }
-                updateOverview { $0.gitSizeState = .scanning }
-            }, onFinished: { [weak self] result in
-                guard let self, generation == token else { return }
-                updateOverview {
+            sizeQueue.enqueueGitStorage(project, onStarted: { [weak session] in
+                guard let session, session.worktreeLoading.accepts(token) else { return }
+                session.updateOverview { $0.gitSizeState = .scanning }
+            }, onFinished: { [weak session] result in
+                guard let session, session.worktreeLoading.accepts(token) else { return }
+                session.updateOverview {
                     $0.gitSizeState = .idle
                     $0.gitRefreshPending = false
                     switch result {
@@ -959,16 +1107,20 @@ final class AppStore {
         deletionError = nil
         deletionBatchID = request.id
         deletionEntries = request.entries
-        progressText = "Authenticating…"
+        deletionProgressText = "Authenticating…"
         defer { isDeleting = false }
         do {
             try await authenticate("authorize permanent deletion of the \(request.count) selected items in DevBox")
         } catch {
             // Leave the confirmation open so authentication cancellation is non-destructive.
             deletionError = "\(error.localizedDescription)\nNothing was deleted."
-            progressText = ""
+            deletionProgressText = ""
             return
         }
+        // A hidden tab can still have reads in flight. Fence those snapshots at
+        // the mutation boundary so they cannot repopulate a deleted row/ref.
+        selectedProjectSession?.cancelLoading()
+        sizeQueue.cancelAll()
         switch request.items {
         case .worktrees(let project, let rows):
             await runDeletionBatch { index in
@@ -980,7 +1132,8 @@ final class AppStore {
             }
         case .databases(let connection, let rows):
             do {
-                let password = try password(for: connection.id)
+                let password = try await password(for: connection.id)
+                try Task.checkCancellation()
                 await runDeletionBatch { index in
                     try await dropDatabase(rows[index], connection.settings, password)
                 }
@@ -995,7 +1148,7 @@ final class AppStore {
         case .worktrees(let project, _):
             sizeQueue.cancel(worktreeIDs: completed)
             projectSessions[project.id]?.removeConfirmedWorktrees(ids: completed)
-            if !completed.isEmpty { projectSessions[project.id]?.branchList.invalidateInventory() }
+            if !completed.isEmpty { projectSessions[project.id]?.invalidateBranchInventory() }
         case .branches(let project, _):
             let session = projectSessions[project.id]
             session?.branchList.removeConfirmedBranches(ids: completed)
@@ -1003,14 +1156,14 @@ final class AppStore {
                 if case .uncertain = $0.state { return true }
                 return false
             }) {
-                session?.branchList.invalidateInventory()
+                session?.invalidateBranchInventory()
             }
             // Recompute upstream/merge information when returning to Worktrees.
             session?.updateOverview { $0.branches = nil; $0.branchError = nil }
         case .databases(let connection, _):
             databaseSessions[connection.id]?.removeConfirmedDatabases(ids: completed)
         }
-        progressText = ""
+        deletionProgressText = ""
         worktreeSelection = []
         selectedProjectSession?.branchList.selection = []
         databaseSelection = []
@@ -1030,7 +1183,7 @@ final class AppStore {
                 deletionEntries[index].elapsed = Double(duration.seconds) + Double(duration.attoseconds) / 1e18
             }
             deletionEntries[index].state = .deleting
-            progressText = "Deleting \(index + 1) of \(deletionEntries.count): \(deletionEntries[index].name)"
+            deletionProgressText = "Deleting \(index + 1) of \(deletionEntries.count): \(deletionEntries[index].name)"
             do {
                 try await operation(index)
                 deletionEntries[index].state = .completed
