@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import DevBox
 @testable import DevBoxCore
@@ -38,6 +39,42 @@ private enum ScanFailure: Error {
     case expected
 }
 
+/// Blocks actual I/O workers without blocking the test's MainActor.
+private final class SizeWorkerGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var permits = 0
+    private var arrivals = 0
+    private var waiter: CheckedContinuation<Void, Never>?
+
+    func block() {
+        condition.lock()
+        arrivals += 1
+        if arrivals == 2 {
+            let ready = waiter
+            waiter = nil
+            ready?.resume()
+        }
+        while permits == 0 { condition.wait() }
+        permits -= 1
+        condition.unlock()
+    }
+
+    func waitForTwo() async {
+        await withCheckedContinuation { continuation in
+            condition.lock()
+            if arrivals >= 2 { continuation.resume() } else { waiter = continuation }
+            condition.unlock()
+        }
+    }
+
+    func releaseAll() {
+        condition.lock()
+        permits += 4
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
 @MainActor
 private final class SizeQueueEvents {
     var started: [String] = []
@@ -68,9 +105,40 @@ private final class SizeQueueEvents {
 @MainActor
 struct WorktreeSizeQueueTests {
     @Test
+    func defaultScansLeaveWorkersAvailableForInteractiveReads() async throws {
+        let executor = BlockingIOExecutor(maxConcurrentOperations: 4)
+        let gate = SizeWorkerGate()
+        defer { gate.releaseAll() }
+        let queue = WorktreeSizeQueue(scan: { _ in
+            try await executor.run(priority: .background) { _ in
+                gate.block()
+                return DiskUsage(bytes: 10, fileCount: 1, unreadableCount: 0)
+            }
+        })
+        let events = SizeQueueEvents()
+        for id in ["a", "b", "c", "d"] { #expect(events.enqueue(id, in: queue)) }
+        guard events.started == ["a", "b"] else {
+            Issue.record("Background scans must not occupy all four I/O workers")
+            gate.releaseAll()
+            await events.waitForFinished(4)
+            return
+        }
+        await gate.waitForTwo()
+        // These finish while both scan workers are deliberately held. No timing
+        // threshold or scheduler sleep is needed to prove interactive capacity.
+        let reads = (0..<2).map { value in
+            Task { try await executor.run(priority: .interactive) { _ in value } }
+        }
+        for (value, read) in reads.enumerated() { #expect(try await read.value == value) }
+        #expect(events.finished.isEmpty)
+        gate.releaseAll()
+        await events.waitForFinished(4)
+    }
+
+    @Test
     func concurrencyCapAndPendingJobsAdvance() async throws {
         let scanner = ControlledSizeScanner()
-        let queue = WorktreeSizeQueue(limit: 2, scan: { try await scanner.scan($0) })
+        let queue = WorktreeSizeQueue(scan: { try await scanner.scan($0) })
         let events = SizeQueueEvents()
         for id in ["a", "b", "c", "d"] {
             #expect(events.enqueue(id, in: queue))

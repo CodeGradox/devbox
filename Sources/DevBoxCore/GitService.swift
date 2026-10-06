@@ -103,7 +103,7 @@ public struct GitService: Sendable {
     public init() {}
 
     public func discoverProject(at path: String) async throws -> ProjectRecord {
-        try await background {
+        try await background(priority: .interactive) {
             let anchor = Self.canonical(path)
             let common = try Self.line(Self.git(["-C", anchor, "rev-parse", "--path-format=absolute", "--git-common-dir"]))
             let id = Self.canonical(common)
@@ -117,11 +117,11 @@ public struct GitService: Sendable {
     }
 
     public func listWorktrees(project: ProjectRecord) async throws -> [WorktreeRecord] {
-        try await background { try Self.worktrees(project) }
+        try await background(priority: .interactive) { try Self.worktrees(project) }
     }
 
     public func status(worktree: WorktreeRecord) async throws -> GitStatus {
-        try await background {
+        try await background(priority: .interactive) {
             guard !worktree.isBare, worktree.exists else {
                 throw GitServiceError.git("Status is unavailable for a bare or missing worktree.")
             }
@@ -130,7 +130,7 @@ public struct GitService: Sendable {
     }
 
     public func diskUsage(worktree: WorktreeRecord) async throws -> DiskUsage {
-        try await background {
+        try await background(priority: .background) {
             try BlockingIOExecutor.checkCancellation()
             // A bare repository consists entirely of shared Git metadata.
             if worktree.isBare { return DiskUsage(bytes: 0, fileCount: 0, unreadableCount: 0) }
@@ -153,7 +153,7 @@ public struct GitService: Sendable {
     /// Repository storage is measured once, separately from exclusive checkout
     /// contents. Bare repositories can contain checkouts inside their Git directory.
     public func gitStorageUsage(project: ProjectRecord) async throws -> DiskUsage {
-        try await background {
+        try await background(priority: .background) {
             let records = try Self.worktrees(project)
             return try FTSDiskScanner.scan(
                 rootPath: Self.canonical(project.id),
@@ -249,7 +249,9 @@ public struct GitService: Sendable {
     }
 
     private static func readStatus(_ path: String) throws -> GitStatus {
-        let data = try git(["-C", path, "status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        // Status is observational: don't refresh the index as a side effect, or
+        // contend with an editor's Git operation while inspecting worktrees.
+        let data = try git(["--no-optional-locks", "-C", path, "status", "--porcelain=v1", "-z", "--untracked-files=all"])
         let entries = data.split(separator: 0)
         var index = 0
         var staged = 0, modified = 0, untracked = 0, conflicted = 0
@@ -285,8 +287,11 @@ public struct GitService: Sendable {
         return string
     }
 
-    func background<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
-        try await BlockingIOExecutor.shared.run { cancellation in
+    func background<T: Sendable>(
+        priority: BlockingIOExecutor.Priority = .normal,
+        _ operation: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await BlockingIOExecutor.shared.run(priority: priority) { cancellation in
             try cancellation.check()
             return try operation()
         }

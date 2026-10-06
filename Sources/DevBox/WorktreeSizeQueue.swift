@@ -3,6 +3,8 @@ import Foundation
 
 /// One app-wide limit for size scans, including scans that are winding down after
 /// cancellation. The actual synchronous FTS traversal runs in GitService's worker.
+/// Two scans leave capacity in the four-worker I/O executor for interactive Git
+/// reads. Queue priorities alone cannot make room when all workers are occupied.
 @MainActor
 final class WorktreeSizeQueue {
     typealias Scan = @Sendable (WorktreeRecord) async throws -> DiskUsage
@@ -28,7 +30,7 @@ final class WorktreeSizeQueue {
     private var running: [UUID: Running] = [:]
 
     init(
-        limit: Int = 4,
+        limit: Int = 2,
         scan: @escaping Scan = { try await GitService().diskUsage(worktree: $0) },
         gitStorageScan: @escaping GitStorageScan = { try await GitService().gitStorageUsage(project: $0) }
     ) {

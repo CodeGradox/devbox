@@ -205,6 +205,7 @@ final class AppStore {
     private let removeWorktree: @Sendable (WorktreeRecord, ProjectRecord) async throws -> Void
     private let listDatabases: @Sendable (ConnectionSettings, String) async throws -> [DatabaseRecord]
     private let loadStatistics: @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics]
+    private let loadGitStatus: @Sendable (WorktreeRecord) async throws -> GitStatus
     private let editorLauncher: EditorLauncher
     private let chooseEditor: @MainActor () -> URL?
     private let openWorktreeInEditor: @MainActor (String, EditorApplication) async throws -> Void
@@ -275,6 +276,9 @@ final class AppStore {
         loadStatistics: @escaping @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics] = {
             try await DatabaseService().databaseStatistics(settings: $0, password: $1)
         },
+        loadGitStatus: @escaping @Sendable (WorktreeRecord) async throws -> GitStatus = {
+            try await GitService().status(worktree: $0)
+        },
         editorLauncher: EditorLauncher = EditorLauncher(),
         chooseEditor: @escaping @MainActor () -> URL? = { EditorApplicationPicker.choose() },
         openWorktreeInEditor: (@MainActor (String, EditorApplication) async throws -> Void)? = nil,
@@ -294,6 +298,7 @@ final class AppStore {
         self.removeWorktree = removeWorktree
         self.listDatabases = listDatabases
         self.loadStatistics = loadStatistics
+        self.loadGitStatus = loadGitStatus
         self.editorLauncher = editorLauncher
         self.chooseEditor = chooseEditor
         self.openWorktreeInEditor = openWorktreeInEditor ?? { path, application in
@@ -782,23 +787,44 @@ final class AppStore {
     }
 
     private func loadGitStatuses(_ records: [WorktreeRecord], token: UUID) async {
-        for record in records where record.exists && !record.isBare {
-            guard generation == token, !Task.isCancelled else { return }
-            do {
-                let status = try await git.status(worktree: record)
-                guard generation == token, !Task.isCancelled else { return }
-                updateRow(record.id) {
-                    $0.status = status
-                    $0.statusError = nil
-                    $0.statusRefreshPending = false
+        let load = loadGitStatus
+        await withTaskGroup(of: (String, Result<GitStatus, Error>).self) { group in
+            var remaining = records.lazy.filter { $0.exists && !$0.isBare }.makeIterator()
+            var inFlight = 0
+            // Keep only two child tasks alive, replenishing after each published
+            // result. The shared I/O executor separately bounds global workers.
+            while generation == token, !Task.isCancelled {
+                while inFlight < 2, let record = remaining.next() {
+                    guard generation == token, !Task.isCancelled else {
+                        group.cancelAll()
+                        return
+                    }
+                    let added = group.addTaskUnlessCancelled {
+                        do {
+                            try Task.checkCancellation()
+                            return (record.id, .success(try await load(record)))
+                        } catch {
+                            return (record.id, .failure(error))
+                        }
+                    }
+                    if !added { break }
+                    inFlight += 1
                 }
-            } catch {
-                guard generation == token, !Task.isCancelled else { return }
-                updateRow(record.id) {
-                    $0.statusError = error.localizedDescription
+                guard let (id, result) = await group.next() else { return }
+                inFlight -= 1
+                guard generation == token, !Task.isCancelled else { break }
+                updateRow(id) {
+                    switch result {
+                    case .success(let status):
+                        $0.status = status
+                        $0.statusError = nil
+                    case .failure(let error):
+                        $0.statusError = error.localizedDescription
+                    }
                     $0.statusRefreshPending = false
                 }
             }
+            group.cancelAll()
         }
     }
 

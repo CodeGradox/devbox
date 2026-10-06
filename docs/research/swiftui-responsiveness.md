@@ -19,6 +19,11 @@ specific frame-rate improvement. The blocking-I/O boundary now uses a bounded
 OperationQueue executor with cancellation and checked continuations. Use a refresh-time Instruments trace for
 end-to-end responsiveness verification.
 
+The worktree-refresh follow-up bounds status loading to two concurrent tasks,
+prioritizes queued interactive Git reads, and limits background scans to two of
+the executor's four workers. See [worktree refresh measurements](worktree-refresh-performance.md)
+for the synthetic benchmark, safety tests, and sizing-throughput trade-off.
+
 The analysis below describes the pre-refactor design and its rationale.
 
 ## Bottom line

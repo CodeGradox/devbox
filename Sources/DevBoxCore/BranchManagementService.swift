@@ -52,7 +52,7 @@ public struct BranchManagementService: Sendable {
     public init() {}
 
     public func list(project: ProjectRecord) async throws -> [ManagedBranch] {
-        try await GitService().background { try Self.snapshot(project) }
+        try await GitService().background(priority: .interactive) { try Self.snapshot(project) }
     }
 
     public func fetch(project: ProjectRecord) async throws {

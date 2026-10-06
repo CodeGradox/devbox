@@ -12,6 +12,18 @@ final class BlockingIOExecutor: Sendable {
     private let queue: OperationQueue
     private let signposter = OSSignposter(subsystem: "app.devbox.DevBox", category: "Blocking I/O")
 
+    enum Priority: Sendable {
+        case interactive, normal, background
+
+        var queuePriority: Operation.QueuePriority {
+            switch self {
+            case .interactive: .high
+            case .normal: .normal
+            case .background: .low
+            }
+        }
+    }
+
     final class Cancellation: Sendable {
         private let cancelled = Mutex(false)
 
@@ -33,13 +45,14 @@ final class BlockingIOExecutor: Sendable {
     var outstandingOperationCount: Int { queue.operationCount }
 
     func run<T: Sendable>(
+        priority: Priority = .normal,
         _ operation: @escaping @Sendable (Cancellation) throws -> T
     ) async throws -> T {
         let cancellation = Cancellation()
         return try await withTaskCancellationHandler {
             try Task.checkCancellation()
             return try await withCheckedThrowingContinuation { continuation in
-                queue.addOperation { [signposter] in
+                let job = BlockOperation { [signposter] in
                     let interval = signposter.beginInterval("Blocking operation")
                     defer { signposter.endInterval("Blocking operation", interval) }
                     let result = Result {
@@ -52,6 +65,10 @@ final class BlockingIOExecutor: Sendable {
                     // cancellation arrives afterward. Callers suppress stale UI results.
                     continuation.resume(with: result)
                 }
+                // Reorder queued work only. Running jobs keep their slots until
+                // completion/cancellation is observed; there is no preemption.
+                job.queuePriority = priority.queuePriority
+                queue.addOperation(job)
             }
         } onCancel: {
             cancellation.cancel()

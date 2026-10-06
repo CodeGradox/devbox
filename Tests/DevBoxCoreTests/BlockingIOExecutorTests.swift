@@ -93,6 +93,33 @@ struct BlockingIOExecutorTests {
     }
 
     @Test
+    func queuedInteractiveReadsPrecedeOlderBackgroundWork() async throws {
+        let executor = BlockingIOExecutor(maxConcurrentOperations: 1)
+        let gate = IOGate()
+        let order = Mutex<[String]>([])
+        let blocker = Task { try await executor.run { _ in gate.block() } }
+        await gate.waitForArrivals(1)
+        let background = Task {
+            try await executor.run(priority: .background) { _ in order.withLock { $0.append("scan") } }
+        }
+        while executor.outstandingOperationCount < 2 { await Task.yield() }
+        let normal = Task {
+            try await executor.run { _ in order.withLock { $0.append("normal") } }
+        }
+        while executor.outstandingOperationCount < 3 { await Task.yield() }
+        let interactive = Task {
+            try await executor.run(priority: .interactive) { _ in order.withLock { $0.append("status") } }
+        }
+        while executor.outstandingOperationCount < 4 { await Task.yield() }
+        gate.release()
+        try await blocker.value
+        try await interactive.value
+        try await normal.value
+        try await background.value
+        #expect(order.withLock { $0 } == ["status", "normal", "scan"])
+    }
+
+    @Test
     func canceledQueuedWorkDoesNotExecute() async throws {
         let executor = BlockingIOExecutor(maxConcurrentOperations: 1)
         let gate = IOGate()

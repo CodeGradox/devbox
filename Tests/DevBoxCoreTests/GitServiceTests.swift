@@ -92,6 +92,27 @@ private struct Fixture {
     #expect(status.conflicted == 0)
 }
 
+@Test func statusDoesNotRefreshIndexOrHideWorkingTreeChanges() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let record = try #require(try await service.listWorktrees(project: project).first)
+    let index = fixture.repository.appendingPathComponent(".git/index")
+    let before = try Data(contentsOf: index)
+    // A changed stat cache with identical content normally invites an optional
+    // index refresh. Reading status must not take that write opportunity.
+    try FileManager.default.setAttributes(
+        [.modificationDate: Date(timeIntervalSince1970: 1_600_000_000)],
+        ofItemAtPath: fixture.repository.appendingPathComponent("tracked").path
+    )
+    #expect(try await service.status(worktree: record).isClean)
+    #expect(try Data(contentsOf: index) == before)
+    try fixture.write("tracked", "modified\n")
+    #expect(try await service.status(worktree: record).modified == 1)
+    #expect(try Data(contentsOf: index) == before)
+}
+
 @Test func diskUsageIncludesIgnoredButNotMetadataOrSymlinkTargets() async throws {
     let fixture = try Fixture()
     defer { fixture.cleanup() }
