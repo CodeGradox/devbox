@@ -58,7 +58,7 @@ not part of these jobs.
 
 Build jobs grant only `contents: read`, pin official checkout and upload
 actions to full commit SHAs, and disable checkout credential persistence.
-Only the opt-in signed-release publishing job gets `contents: write` and `actions: read`,
+Only the tag-triggered publishing job gets `contents: write` and `actions: read`,
 using GitHub's automatic short-lived token rather than a personal access token.
 The pins were checked against GitHub's public tag API:
 
@@ -71,36 +71,41 @@ There is no `pull_request_target` or CI signing secret. Pull requests and ordina
 branch pushes cannot publish releases. Review action updates and verify replacement
 SHAs before changing pins.
 
-## Build or publish a signed release
+## Publish a tagged release
 
-Use **Actions → Release DevBox → Run workflow**, selecting **main**.
-The workflow uses the protected `release` environment. It builds and verifies a
-Developer ID-signed, notarized disk image, **DevBox-macos-arm64.dmg**.
+Only pushing a version tag triggers **Release DevBox**. Normal pushes and pull
+requests run ordinary CI; they do not create a DMG or contact Apple's notary
+service. There is no manual release button or publish checkbox.
 
-- Leave **publish** unchecked (the default) to test a signed build without
-  publishing. Download the **DevBox-macos-arm64** artifact from that run. GitHub
-  wraps Actions artifacts in a ZIP containing the DMG and `SHA256SUMS.txt`;
-  that wrapper is only for CI downloads.
-- Check **publish** to create a GitHub Release after all signing, notarization,
-  and packaging checks pass. Users download the DMG directly, without an outer
-  ZIP or nested folders. The optional checksum file is a separate release asset.
+Update `CFBundleShortVersionString` and `CFBundleVersion` in `Resources/Info.plist`,
+commit/push to `main`, then tag that commit with a fresh stable version:
 
-Before publishing, update `CFBundleShortVersionString` and `CFBundleVersion` in
-`Resources/Info.plist`, then commit/push to `main`. Use a fresh stable semantic
-version (`MAJOR.MINOR.PATCH`). The publishing job creates `vVERSION` at the exact
-build commit and refuses an existing tag. It never moves tags or replaces assets.
-There is no need to create/push a tag manually; tag pushes no longer publish
-ad-hoc downloads.
+```sh
+git switch main
+GIT_EDITOR=true git tag -a v0.3.2 -m "DevBox v0.3.2"
+git push origin refs/tags/v0.3.2
+```
+
+Use a new version for each release; do not move an existing tag. The workflow
+requires `vMAJOR.MINOR.PATCH` to match the app's version and the tagged commit to
+be in `main`'s history before building or using signing credentials.
+
+The protected `release` job tests, builds, signs, and notarizes
+**DevBox-macos-arm64.dmg**. On success, the publishing job automatically creates
+the GitHub Release using the existing tag. Users download the DMG directly;
+`SHA256SUMS.txt` is a separate optional asset. The same files are retained in the
+run's **DevBox-macos-arm64** Actions artifact, which has GitHub's ZIP wrapper.
 
 The publishing job uses ordinary `gh release` commands: download the signed
-artifact from this exact run, verify its checksum, create a new tag and draft,
+artifact from this exact run, verify its checksum, create a draft for the tag,
 upload the DMG and checksum, then publish. No signing credentials are exposed
 to this job. If uploading fails, the draft stays unpublished; recover that
 unpublished draft manually or use a new version. There is no automatic overwrite
 or draft-resume logic.
 
-Selecting another branch or tag skips both signing and publishing. There is no
-arbitrary checkout-ref input. Release assets have no Actions retention expiry.
+Before publishing, the job rechecks that the existing tag still points to the
+exact signed commit. It never creates or moves tags, and it refuses to overwrite
+an existing release. Release assets have no Actions retention expiry.
 Download from [the latest release](https://github.com/CodeGradox/devbox/releases/latest).
 Existing releases through v0.3.1 remain ad-hoc signed; they are not replaced.
 
@@ -111,9 +116,11 @@ Before enabling it:
 1. Protect `main` against deletion and force-pushes, and limit write access to
    trusted maintainers. Review workflow, script, entitlement, dependency, and
    application changes before signing them.
-2. Create a GitHub environment named **release** and restrict deployment branches
-   to **main only**. Add trusted required reviewers if appropriate for your team.
-   Do not enable signing until the environment restrictions are configured.
+2. In the GitHub environment named **release**, choose **Selected branches and
+   tags**, add a **Tag** rule for `v*`, and remove the old **main branch** rule.
+   Protect `v*` release tags against updates/deletion and allow only trusted
+   maintainers to create them. Add trusted required reviewers if appropriate.
+   Do not enable signing until these environment and tag protections are configured.
    A workflow's `if` guard alone is not a boundary against someone who can
    change a workflow on another branch.
 3. Join the paid **Apple Developer Program**, or use your existing team's membership.
@@ -145,8 +152,8 @@ Base64 is encoding, not encryption. Supply these directly through GitHub's
 secret UI or your approved secret-management tooling; never paste them into
 source files, issues, or this conversation.
 
-6. Dispatch **Release DevBox** on `main`; reviewers should
-   verify the exact run commit before approving environment access. Tests run
+6. Push a version tag from `main`; reviewers should
+   verify the exact tagged commit before approving environment access. Tests run
    before credentials are imported. The release step imports the supplied
    certificate into a temporary keychain and signs the app with hardened runtime
    and a secure timestamp. It packages the app with `dmgbuild`, signs the DMG,
@@ -156,7 +163,7 @@ source files, issues, or this conversation.
 
 Use the exact certificate name for `DEVBOX_SIGNING_IDENTITY`. A secret-only
 correction can use **Re-run failed jobs** for signing. Script changes require a
-new **Run workflow** after reaching `main`; rerunning an old run uses old code.
+new version/tag after reaching `main`; rerunning an old tag uses old code.
 
 The script traps exit/signals to remove its temporary keychain and credential
 files, with an additional `always()` workflow cleanup step. Only ephemeral

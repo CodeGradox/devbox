@@ -1,22 +1,17 @@
 name: Release DevBox
-run-name: "${{ inputs.publish && 'Publish' || 'Build' }} signed DevBox for macOS"
+run-name: "Release ${{ github.ref_name }}"
 
 on:
-  workflow_dispatch:
-    inputs:
-      publish:
-        description: Publish the signed DMG as a GitHub Release for the app version
-        type: boolean
-        required: true
-        default: false
+  push:
+    tags: ['v*']
 
 permissions:
   contents: read
 
 jobs:
   release:
-    # No user-supplied ref input: only reviewed main may access credentials.
-    if: github.ref == 'refs/heads/main'
+    # Protect v* tags and restrict the release environment to those tags.
+    if: github.event.deleted == false && startsWith(github.ref, 'refs/tags/v')
     name: Sign and notarize arm64
     environment: release
     runs-on: macos-26
@@ -25,6 +20,7 @@ jobs:
       ARCH: arm64
     outputs:
       version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
       - name: Isolate build outputs
         run: |
@@ -33,17 +29,22 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Read release version from the app
+          fetch-depth: 0
+      - name: Validate release tag and main ancestry
         id: version
         run: |
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          test "$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")" = "$(git rev-parse HEAD)"
           python3 - <<'PY'
           import os, plistlib, re
           with open("Resources/Info.plist", "rb") as source:
               version = plistlib.load(source)["CFBundleShortVersionString"]
           assert re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version), "Expected a stable semantic version"
+          assert os.environ["GITHUB_REF_NAME"] == f"v{version}", "Tag must match the app version"
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
               output.write(f"version={version}\n")
           PY
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Check native toolchain and test before importing secrets
         run: |
           test "$(uname -m)" = "$ARCH"
@@ -109,7 +110,6 @@ jobs:
 
   publish:
     name: Publish signed download
-    if: github.ref == 'refs/heads/main' && inputs.publish
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -123,6 +123,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       RELEASE_VERSION: ${{ needs.release.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.release.outputs.commit }}
     steps:
       - name: Download signed assets from this exact run
         run: |
@@ -134,10 +135,9 @@ jobs:
           cd "$RUNNER_TEMP/signed-downloads"
           sha256sum DevBox-macos-arm64.dmg | diff - SHA256SUMS.txt
           tag="v$RELEASE_VERSION"
-          # Creating the exact ref fails if it already exists; never move a tag.
-          gh api --method POST "repos/$GH_REPO/git/refs" --silent \
-            -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA"
-          gh release create "$tag" --verify-tag --target "$GITHUB_SHA" \
+          # Refuse a tag that moved while the signed build was running.
+          test "$(gh api "repos/$GH_REPO/commits/$GITHUB_REF" --jq .sha)" = "$RELEASE_COMMIT"
+          gh release create "$tag" --verify-tag --target "$RELEASE_COMMIT" \
             --draft --title "DevBox $RELEASE_VERSION" \
             --notes "Requires Apple Silicon and macOS 26 or newer. Open the DMG, drag DevBox into Applications, then eject it. Developer ID-signed and Apple-notarized. The checksum file is optional; MariaDB is installed separately."
           gh release upload "$tag" DevBox-macos-arm64.dmg SHA256SUMS.txt
