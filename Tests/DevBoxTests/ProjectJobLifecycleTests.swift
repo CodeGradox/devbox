@@ -68,7 +68,7 @@ private actor LifecycleInputs {
 
 @MainActor
 private func waitForLifecycle(_ value: @escaping @MainActor () -> Bool) async {
-    for await finished in Observations(value) {
+    for await finished in Observations({ value() }) {
         if finished { return }
     }
 }

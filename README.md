@@ -120,8 +120,10 @@ The optional `SHA256SUMS.txt` release asset is for verifying the download, not
 installation. A GitHub Release downloads the DMG directly. Downloads from
 **Actions → Artifacts** have an extra GitHub ZIP wrapper; unpack it to find the DMG.
 
-Older releases through **v0.3.1** and ordinary CI artifacts are still ad-hoc signed,
-not notarized. Prefer a new signed release rather than disabling Gatekeeper.
+Older releases through **v0.3.1** and historical ad-hoc CI artifacts are not
+notarized. Current branch and pull-request CI runs tests only; signed downloads
+are built and published only for new version tags.
+Prefer a new signed release rather than disabling Gatekeeper.
 Switching from an older build may prompt again for Keychain access.
 
 ## Getting started

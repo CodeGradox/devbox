@@ -7,6 +7,16 @@ struct ContentView: View {
     @Environment(\.locale) private var locale
     @Binding var theme: AppTheme
 
+    private var navigationTitle: LocalizedStringKey {
+        if store.selectedProject != nil {
+            "Projects"
+        } else if store.selectedConnection != nil {
+            "MariaDB"
+        } else {
+            "Workspace"
+        }
+    }
+
     var body: some View {
         @Bindable var store = store
         NavigationSplitView {
@@ -23,7 +33,7 @@ struct ContentView: View {
                     WelcomeView()
                 }
             }
-            .navigationTitle(store.selectedProject?.name ?? store.selectedConnection?.name ?? "DevBox")
+            .navigationTitle(navigationTitle)
             .toolbar {
                 WorkspaceToolbar()
             }
@@ -152,14 +162,6 @@ private struct SidebarView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .help("Choose Light, Dark, or follow the system appearance")
-                HStack {
-                    Image(systemName: "hammer")
-                    Text("DevBox").fontWeight(.medium)
-                    Spacer()
-                    Text("v0").foregroundStyle(.tertiary)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
             }
             .padding(14)
         }

@@ -1,4 +1,4 @@
-# macOS builds and optional notarized downloads
+# macOS tests and signed releases
 
 DevBox is a SwiftPM application: no Xcode project is needed. Building requires
 Swift 6.2 or newer and a macOS 26 SDK; running requires **macOS 26 or newer**.
@@ -39,25 +39,23 @@ captures as `branches.900.png` and `branches.1140.png`.
 
 ## Ordinary CI: no credentials
 
-`build.yml` runs for pull requests, pushes to `main`, and manual
-dispatch. It runs `sh scripts/test.sh`, builds an optimized arm64 release app,
-checks its architecture, deployment target, and ad hoc signature, and uploads
-app and standalone-executable ZIPs plus SHA-256 checksums. Download them from
-the Actions run's **Artifacts** section. Unpack the outer artifact archive,
-then the inner `ditto` ZIP, which preserves executable permissions and app
-metadata. The standalone executable is mainly useful for inspection; prefer
-the app bundle for normal use.
+`tests.yml` (**macOS tests**) runs for pushes to every branch, including nested
+names such as `feature/example`, for pull requests, and for manual dispatch.
+Its explicit branch filter excludes tag pushes. It runs `sh scripts/test.sh`;
+compiling the tests is the only build work. It does not package an app, sign,
+notarize, upload artifacts, or publish a release.
 
-Artifacts are explicitly labeled **adhoc-non-notarized**, expire after 14 days,
-and are not GitHub Releases. They are not Apple-trusted distribution builds.
+This replaces the old ad-hoc build workflow. Historical runs and their artifacts
+may remain visible until they expire, but no new ad-hoc downloads are produced.
 Normal tests inject in-memory credentials and do not need a user's Keychain,
 MariaDB server, or database password. Database integration is deliberately
 disabled by unsetting `DEVBOX_TEST_MARIADB_SOCKET`; the existing
 `scripts/test-mariadb.sh` is a separate opt-in isolated integration script,
 not part of these jobs.
 
-Build jobs grant only `contents: read`, pin official checkout and upload
-actions to full commit SHAs, and disable checkout credential persistence.
+Test and release-build jobs grant only `contents: read` and disable checkout
+credential persistence. Checkout and release-artifact upload actions are pinned
+to full commit SHAs.
 Only the tag-triggered publishing job gets `contents: write` and `actions: read`,
 using GitHub's automatic short-lived token rather than a personal access token.
 The pins were checked against GitHub's public tag API:
@@ -73,9 +71,11 @@ SHAs before changing pins.
 
 ## Publish a tagged release
 
-Only pushing a version tag triggers **Release DevBox**. Normal pushes and pull
-requests run ordinary CI; they do not create a DMG or contact Apple's notary
-service. There is no manual release button or publish checkbox.
+Only pushing a new version tag triggers the build and publishing jobs in
+**Release DevBox**. Updating or deleting an existing tag does not rebuild it.
+Normal branch pushes and pull requests run tests only; they do not create a DMG
+or contact Apple's notary service. There is no manual release button or publish
+checkbox. The release workflow reruns tests before importing signing credentials.
 
 Update `CFBundleShortVersionString` and `CFBundleVersion` in `Resources/Info.plist`,
 commit/push to `main`, then tag that commit with a fresh stable version:

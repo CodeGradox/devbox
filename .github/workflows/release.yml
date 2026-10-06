@@ -10,8 +10,9 @@ permissions:
 
 jobs:
   release:
-    # Protect v* tags and restrict the release environment to those tags.
-    if: github.event.deleted == false && startsWith(github.ref, 'refs/tags/v')
+    # Only new version tags release; updates/deletions must not rebuild a version.
+    # Also protect v* tags and restrict the release environment to those tags.
+    if: github.event.created == true && startsWith(github.ref, 'refs/tags/v')
     name: Sign and notarize arm64
     environment: release
     runs-on: macos-26

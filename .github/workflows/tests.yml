@@ -1,0 +1,43 @@
+name: macOS tests
+
+on:
+  pull_request:
+  push:
+    # An explicit branch filter includes nested branch names and excludes tags.
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test arm64
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      ARCH: arm64
+    steps:
+      - name: Isolate test build outputs
+        run: |
+          echo "SWIFT_BUILD_PATH=$RUNNER_TEMP/devbox-swift" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify native architecture and toolchain
+        run: |
+          test "$(uname -m)" = "$ARCH"
+          xcodebuild -version
+          swift --version
+          python3 - <<'PY'
+          import re, subprocess
+          swift = subprocess.check_output(["swift", "--version"], text=True)
+          version = tuple(map(int, re.search(r"Swift version (\d+)\.(\d+)", swift).groups()))
+          assert version >= (6, 2), swift
+          sdk = subprocess.check_output(["xcrun", "--sdk", "macosx", "--show-sdk-version"], text=True).strip()
+          assert int(sdk.split(".")[0]) >= 26, sdk
+          PY
+      - name: Test without database integration
+        run: |
+          unset DEVBOX_TEST_MARIADB_SOCKET
+          sh scripts/test.sh
