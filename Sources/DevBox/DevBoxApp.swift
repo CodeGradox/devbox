@@ -19,6 +19,7 @@ struct DevBoxApp: App {
                 .task {
                     delegate.store = store
                     store.loadSelection()
+                    await store.github.restoreIfNeeded()
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                     store.refreshEditorApplications()
@@ -45,6 +46,9 @@ private struct DevBoxCommands: Commands {
                 store.connectionEditor = .init()
             }
             .disabled(store.isDeleting || store.isModalPresented)
+            Divider()
+            Button("GitHub Account…") { store.activeSheet = .github() }
+                .disabled(store.isDeleting || store.isModalPresented)
         }
         CommandGroup(replacing: .undoRedo) {}
         CommandGroup(after: .toolbar) {

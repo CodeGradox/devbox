@@ -37,6 +37,13 @@ struct BranchesView: View {
                     .width(min: 150, ideal: 200)
                     TableColumn("GitHub") { row in BranchGitHubCell(url: row.branch.githubURL) }
                         .width(min: 60, ideal: 70, max: 90)
+                    TableColumn("Latest PR") { row in
+                        BranchPullRequestCell(
+                            branch: row.githubBranch, session: store.github, disabled: busy,
+                            showAccount: { store.activeSheet = .github() }
+                        )
+                    }
+                    .width(min: 110, ideal: 160, max: 220)
                 }
                 .contextMenu(forSelectionType: String.self) { ids in
                     Button("Delete selected…", role: .destructive) {
@@ -60,6 +67,11 @@ struct BranchesView: View {
             }
             StatusFooter {
                 Text("\(session.rows.count) branches · \(session.selectedBranches.count) selected")
+                BranchPullRequestStatus(
+                    branches: Set(session.rows.compactMap(\.githubBranch)),
+                    session: store.github, disabled: busy,
+                    showAccount: { store.activeSheet = .github() }
+                )
             }
         }
     }
@@ -82,6 +94,11 @@ struct BranchesView: View {
                 Button("Fetch & Prune", action: store.fetchBranches)
                     .help("Contacts all remotes, fetches branches, and prunes obsolete remote tracking refs.")
                     .disabled(busy)
+                BranchPullRequestControls(
+                    branches: Set(session.rows.compactMap(\.githubBranch)),
+                    session: store.github, disabled: busy,
+                    showAccount: { store.activeSheet = .github() }
+                )
                 Button {
                     showsOptions.toggle()
                 } label: {
@@ -106,6 +123,7 @@ struct BranchesView: View {
             Text("Latest commit is a proxy for activity, not the last checkout or view. Committer is the commit identity, not the server pusher.")
             Text(session.fetchDescription)
             Text("Refresh rereads local refs without contacting the server. Fetch & Prune contacts all remotes and removes obsolete tracking refs.")
+            Text("Refresh PRs contacts GitHub for visible branches. Latest PR means newest created, including open, merged, and closed PRs. Results stay cached until refreshed.")
             Divider()
             Toggle("Load committer icons from Gravatar", isOn: $gravatarEnabled)
                 .toggleStyle(.checkbox)

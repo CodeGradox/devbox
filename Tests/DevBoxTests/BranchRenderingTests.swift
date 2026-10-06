@@ -14,6 +14,14 @@ private final class RenderingBranchSettings: SettingsPersisting {
     func save(_ settings: AppSettings) throws { value = settings }
 }
 
+@MainActor
+private final class RenderingGitHubCredentials: GitHubCredentialsPersisting {
+    var token: GitHubToken? = GitHubToken(accessToken: "rendering-fixture")
+    func load() throws -> GitHubToken? { token }
+    func save(_ token: GitHubToken) throws { self.token = token }
+    func remove() throws { token = nil }
+}
+
 @Suite(.serialized)
 @MainActor
 struct BranchRenderingTests {
@@ -45,8 +53,8 @@ struct BranchRenderingTests {
         #expect(bitmap.pixelsWide > 0)
     }
 
-    @Test(.timeLimit(.minutes(1)))
-    func fullBranchViewAndMixedConfirmationRenderWithoutNetwork() async throws {
+    @Test(.timeLimit(.minutes(1)), arguments: [false, true])
+    func fullBranchViewAndMixedConfirmationRenderWithoutNetwork(prFails: Bool) async throws {
         _ = NSApplication.shared
         let persistence = RenderingBranchSettings()
         persistence.value.projects = [.init(id: "/test/repo/.git", name: "Example", path: "/Projects/example")]
@@ -70,8 +78,27 @@ struct BranchRenderingTests {
                 githubURL: URL(string: "https://github.com/example/repo/tree/feature%2Fbranch-manager")
             )
         ]
+        let github = GitHubSession(
+            credentials: RenderingGitHubCredentials(),
+            pullRequests: GitHubPullRequestCache(
+                repositories: { repository, _ in [repository] },
+                lookup: { branches, _, _ in
+                    let request = GitHubPullRequest(
+                        number: 42, title: "Add branch management",
+                        url: URL(string: "https://github.com/example/repo/pull/42")!,
+                        state: .merged, createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+                    )
+                    return GitHubPullRequestBatch(results: Dictionary(uniqueKeysWithValues: branches.map {
+                        ($0, prFails ? .failure(.notFound) : .success(request))
+                    }))
+                }
+            ),
+            loadUser: { _ in GitHubUser(login: "example", id: 1) },
+            openBrowser: { _ in }
+        )
+        await github.restore()
         let store = AppStore(
-            persistence: persistence, listManagedBranches: { _ in branches },
+            persistence: persistence, github: github, listManagedBranches: { _ in branches },
             editorLauncher: inertEditorLauncher()
         )
         store.projectSection = .branches
@@ -106,7 +133,7 @@ struct BranchRenderingTests {
             host.cacheDisplay(in: host.bounds, to: bitmap)
             #expect(bitmap.pixelsWide >= Int(width))
             let table = try #require(tables(in: host).first {
-                $0.numberOfRows == branches.count && $0.tableColumns.count == 4
+                $0.numberOfRows == branches.count && $0.tableColumns.count == 5
             })
             let list = try #require(store.selectedProjectSession?.branchList)
             for (index, column) in [
@@ -123,6 +150,7 @@ struct BranchRenderingTests {
                 }
             }
             #expect(table.tableColumns[3].sortDescriptorPrototype == nil)
+            #expect(table.tableColumns[4].sortDescriptorPrototype == nil)
             // Native table membership and cacheDisplay can pass while SwiftUI's
             // on-screen content is completely blank. Opt in on a GUI session:
             // DEVBOX_UI_TESTS=1 sh scripts/test.sh --filter BranchRenderingTests
@@ -136,10 +164,16 @@ struct BranchRenderingTests {
                 for label in ["Projects", "Branches", "Latest commit", "Taylor", "Fetch & Prune"] {
                     #expect(text.contains(label), "Visible window is missing \(label) at width \(width). OCR: \(text)")
                 }
+                if width == 1140 {
+                    let labels = prFails ? ["Latest PR", "Unavailable", "1 PR lookup failed"] : ["Latest PR", "Merged", "PRs cached"]
+                    for label in labels {
+                        #expect(text.contains(label), "Visible PR UI is missing \(label). OCR: \(text)")
+                    }
+                }
                 if let path = ProcessInfo.processInfo.environment["DEVBOX_BRANCH_SCREENSHOT"] {
                     let screenshot = NSBitmapImageRep(cgImage: image)
                     let url = URL(fileURLWithPath: path).deletingPathExtension()
-                        .appendingPathExtension("\(Int(width)).png")
+                        .appendingPathExtension("\(prFails ? "unavailable." : "")\(Int(width)).png")
                     try #require(screenshot.representation(using: .png, properties: [:])).write(to: url)
                 }
             }
@@ -151,6 +185,87 @@ struct BranchRenderingTests {
         host.frame = NSRect(x: 0, y: 0, width: 560, height: 600)
         host.layoutSubtreeIfNeeded()
         #expect(host.fittingSize.width >= 560)
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func gitHubFailureDetailsExposeRepositoryAndRecoveryWithoutNetwork() async throws {
+        _ = NSApplication.shared
+        #expect(NSImage(systemSymbolName: "arrow.triangle.pull", accessibilityDescription: nil) != nil)
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 500),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: GitHubPullRequestFailureDetails(
+            failures: [.init(repository: "example/project", message: GitHubPullRequestError.notFound.localizedDescription,
+                             branchCount: 3)],
+            canRetry: true, retry: {}, showAccount: {}
+        ).environment(\.locale, Locale(identifier: "en_US")).lineLimit(1))
+        window.contentView = host
+        defer { window.close() }
+        window.orderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        host.layoutSubtreeIfNeeded()
+        #expect(host.fittingSize.width == 380)
+        if ProcessInfo.processInfo.environment["DEVBOX_UI_TESTS"] == "1" {
+            let image = try await capture(window)
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.recognitionLanguages = ["en-US"]
+            try VNImageRequestHandler(cgImage: image).perform([request])
+            let text = request.results?.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n") ?? ""
+            for label in ["Pull requests unavailable", "example/project", "3 affected branches", "NOT_FOUND", "Retry PRs"] {
+                #expect(text.contains(label), "PR failure details are missing \(label). OCR: \(text)")
+            }
+        }
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func gitHubAccountSheetRendersDeviceCodeWithoutNetwork() async throws {
+        _ = NSApplication.shared
+        let session = GitHubSession(
+            credentials: RenderingGitHubCredentials(),
+            startAuthorization: {
+                GitHubDeviceAuthorization(
+                    deviceCode: "fixture-device", userCode: "ABCD-EFGH",
+                    verificationURL: URL(string: "https://github.com/login/device")!,
+                    expiresAt: Date().addingTimeInterval(900), interval: 5
+                )
+            },
+            poll: { _ in
+                try await Task.sleep(for: .seconds(60))
+                throw CancellationError()
+            },
+            openBrowser: { _ in }
+        )
+        session.beginSignIn()
+        defer { session.cancelSignIn() }
+        for await ready in Observations({ session.authorization != nil }) {
+            if ready { break }
+        }
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 500),
+            styleMask: [.titled], backing: .buffered, defer: false
+        )
+        window.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: GitHubAccountView(session: session)
+            .environment(\.locale, Locale(identifier: "en_US")))
+        window.contentView = host
+        defer { window.close() }
+        window.orderFront(nil)
+        try await Task.sleep(for: .milliseconds(100))
+        host.layoutSubtreeIfNeeded()
+        #expect(host.fittingSize.width == 480)
+        if ProcessInfo.processInfo.environment["DEVBOX_UI_TESTS"] == "1" {
+            let image = try await capture(window)
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            try VNImageRequestHandler(cgImage: image).perform([request])
+            let text = request.results?.compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n") ?? ""
+            for label in ["GitHub Account", "ABCD-EFGH", "Copy code", "Open GitHub", "Cancel sign-in"] {
+                #expect(text.contains(label), "Account sheet is missing \(label). OCR: \(text)")
+            }
+        }
     }
 
     private func tables(in view: NSView) -> [NSTableView] {

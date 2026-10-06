@@ -68,6 +68,7 @@ struct BranchRowPresentation: Identifiable, Equatable {
     let commitDate: String
     let commitHelp: String
     let avatarURL: URL?
+    let githubBranch: GitHubBranch?
     var committer: BranchCommitter {
         BranchCommitter(name: branch.committerName, email: branch.committerEmail)
     }
@@ -81,6 +82,7 @@ struct BranchRowPresentation: Identifiable, Equatable {
         } ?? "Unknown commit date"
         commitHelp = "Latest commit: \(timestamp)\nCommit: \(branch.commit)"
         avatarURL = Gravatar.url(email: branch.committerEmail)
+        githubBranch = branch.githubURL.flatMap { GitHubBranch(branchURL: $0) }
     }
 }
 

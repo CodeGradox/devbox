@@ -141,12 +141,14 @@ enum AppSheet: Identifiable {
     case connection(ConnectionEditorRequest)
     case deletion(DeletionRequest)
     case results(OperationResult)
+    case github(UUID = UUID())
 
     var id: UUID {
         switch self {
         case .connection(let request): request.id
         case .deletion(let request): request.id
         case .results(let result): result.id
+        case .github(let id): id
         }
     }
 }
@@ -195,6 +197,7 @@ final class AppStore {
 
     let git = GitService()
     let databaseService = DatabaseService()
+    let github: GitHubSession
     private let persistence: any SettingsPersisting
     private let credentials: any CredentialsPersisting
     private let authenticate: @MainActor (String) async throws -> Void
@@ -246,6 +249,7 @@ final class AppStore {
     init(
         persistence: any SettingsPersisting = SettingsStore(),
         credentials: any CredentialsPersisting = KeychainCredentials(),
+        github: GitHubSession = GitHubSession(),
         sizeQueue: WorktreeSizeQueue = WorktreeSizeQueue(),
         inspectBranches: @escaping @Sendable (ProjectRecord, [WorktreeRecord]) async throws -> BranchInspection = {
             try await BranchStatusService().inspect(project: $0, worktrees: $1)
@@ -280,6 +284,7 @@ final class AppStore {
     ) {
         self.persistence = persistence
         self.credentials = credentials
+        self.github = github
         self.sizeQueue = sizeQueue
         self.inspectBranches = inspectBranches
         self.listManagedBranches = listManagedBranches

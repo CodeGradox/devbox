@@ -32,6 +32,8 @@ Requires **Apple Silicon (M1 or newer) and macOS 26 or newer**.
   Icons are off by default; unavailable avatars use a local placeholder.
 - Open branches on GitHub when a GitHub remote can be identified. Local branches need an
   existing configured upstream; unpublished branches do not get speculative links.
+- Sign in to GitHub to see each branch's **Latest PR**, with a link and open, merged, or
+  closed status. Latest means newest created, not most recently updated.
 - **Refresh** rereads local refs. **Fetch & Prune** explicitly contacts the configured remotes
   to update remote-tracking refs and remove stale ones.
 - Delete selected local branches, or delete branches from their remote server after explicit
@@ -41,6 +43,38 @@ Checked-out branches, default branches, and unsafe or ambiguous remote configura
 protected. Local deletion refuses unmerged branches unless **Force delete** is explicitly
 enabled. Remote deletion checks the captured commit so it cannot remove a branch that has
 advanced since the last fetch. Server permissions and branch protections still apply.
+
+### GitHub sign-in and pull requests
+
+Choose **Sign in to GitHub…** in the sidebar (or **GitHub Account…** in the File menu).
+DevBox opens GitHub in your browser; enter the displayed code and authorize the app.
+The GitHub App must be installed on the repositories you want to access, with
+**Pull requests: Read-only**. Organization access may require administrator approval.
+
+The branch list loads PRs for visible GitHub branches after sign-in. Local branches use
+their existing upstream; local and remote rows for the same branch share a lookup.
+For forks, DevBox checks the branch's repository and its parent repository. It matches
+the exact source repository and branch name, rather than guessing from the branch name.
+PRs targeting other repositories in a fork network are not included.
+
+PRs load in GraphQL batches of up to 25 branches, with two batches at a time. Results
+appear as batches finish; an individual lookup failure does not discard the other
+branches' successful results. If GitHub throttles requests, DevBox waits until its
+retry deadline before allowing another refresh.
+
+Results are cached in memory. Use **Refresh PRs** (the pull-request icon beside
+**Fetch & Prune**) to contact GitHub again; local **Refresh** and **Fetch & Prune** keep
+their existing Git behavior. **No PR** means a successful lookup found none.
+Click **Unavailable**, or the failure count in the footer, for repository-specific
+errors, recovery steps, and retry. Signing in and installing the App are separate:
+GitHub may return HTTP 404 for a private repository the App cannot access even when
+you can open it in your browser. GitHub Enterprise hosts are not supported yet.
+
+Access and refresh tokens stay in macOS Keychain and refresh automatically. Signing out
+removes this Mac's saved credentials and cached PRs, but does not revoke authorization on
+GitHub; use [GitHub application settings](https://github.com/settings/apps/authorizations)
+to revoke it. No GitHub CLI, client secret, or private key is required.
+Local Git and database features remain available without GitHub sign-in.
 
 ### MariaDB
 
@@ -114,3 +148,4 @@ brew install mariadb-connector-c
 Git features work without MariaDB.
 
 For building from source or publishing releases, see the [developer guide](docs/github-releases.md).
+For GitHub App registration and authentication details, see [GitHub integration](docs/github-integration.md).

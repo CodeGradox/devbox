@@ -36,6 +36,8 @@ struct ContentView: View {
                 DeletionConfirmation(request: request).environment(store)
             case .results(let result):
                 OperationResultsView(result: result)
+            case .github:
+                GitHubAccountView(session: store.github)
             }
         }
         .alert("DevBox", isPresented: Binding(
@@ -137,6 +139,8 @@ private struct SidebarView: View {
         .listStyle(.sidebar)
         .safeAreaInset(edge: .bottom) {
             VStack(alignment: .leading, spacing: 10) {
+                GitHubAccountButton(session: store.github) { store.activeSheet = .github() }
+                    .disabled(store.isDeleting || store.isModalPresented)
                 Text("Appearance")
                     .font(.caption)
                     .foregroundStyle(.secondary)
