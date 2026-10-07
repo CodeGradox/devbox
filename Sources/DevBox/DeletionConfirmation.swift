@@ -52,7 +52,7 @@ struct DeletionConfirmation: View {
                         }
                     case .databases(_, let databases):
                         ForEach(databases) { database in
-                            let entry = store.deletionEntry(for: database.name, in: request)
+                            let entry = store.deletionEntry(for: database.id, in: request)
                             DeletionItemView(
                                 name: database.name, state: entry.state,
                                 startedAt: entry.startedAt, elapsed: entry.elapsed

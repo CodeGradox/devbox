@@ -31,7 +31,7 @@ final class DatabaseStatisticsTests: XCTestCase {
             try DatabaseStatistics.accumulate(["資料`", "view", type, nil, "999", nil], into: &values)
         }
         XCTAssertEqual(values["empty"], .init(tableCount: 0, viewCount: 0, estimatedRows: 0, dataBytes: 0, indexBytes: 0))
-        XCTAssertEqual(values["資料`"], .init(tableCount: 2, viewCount: 2, estimatedRows: 7, dataBytes: 40, indexBytes: 60))
+        XCTAssertEqual(values[DatabaseRecord(name: "資料`").id], .init(tableCount: 2, viewCount: 2, estimatedRows: 7, dataBytes: 40, indexBytes: 60))
     }
 
     func testUnknownAndOverflowPropagatePerMetricWithoutLosingCounts() throws {
@@ -66,5 +66,33 @@ final class DatabaseStatisticsTests: XCTestCase {
         } catch {
             XCTAssertTrue(error is CancellationError)
         }
+    }
+
+    func testDatabaseIdentityIsExactWhereSwiftStringEqualityIsNot() throws {
+        let composed = DatabaseRecord(name: "caf\u{e9}")
+        let decomposed = DatabaseRecord(name: "cafe\u{301}")
+        // MariaDB lists these as two databases; Swift would equate their names.
+        XCTAssertEqual(composed.name, decomposed.name)
+        XCTAssertNotEqual(composed.id, decomposed.id)
+        XCTAssertNotEqual(composed, decomposed)
+        XCTAssertEqual(Set([composed, decomposed]).count, 2)
+        XCTAssertEqual(Dictionary(uniqueKeysWithValues: [composed, decomposed].map { ($0.id, $0) }).count, 2)
+        // Ordinary names are their own id; escaping never makes two different names collide.
+        XCTAssertEqual(DatabaseRecord(name: "my_app-1").id, "my_app-1")
+        XCTAssertNotEqual(DatabaseRecord(name: "a\\u{e9}").id, DatabaseRecord(name: "a\u{e9}").id)
+        XCTAssertNotEqual(DatabaseRecord(name: "a\\").id, DatabaseRecord(name: "a\\\\").id)
+        XCTAssertEqual(DatabaseRecord(name: "資料`"), DatabaseRecord(name: "資料`"))
+    }
+
+    func testStatisticsOfNormalizationVariantsAreNotMerged() throws {
+        let composed = DatabaseRecord(name: "caf\u{e9}")
+        let decomposed = DatabaseRecord(name: "cafe\u{301}")
+        var values: [String: DatabaseStatistics] = [:]
+        try DatabaseStatistics.accumulate([composed.name, "t", "BASE TABLE", "1", "100", "10"], into: &values)
+        try DatabaseStatistics.accumulate([decomposed.name, "t", "BASE TABLE", "2", "900", "90"], into: &values)
+        XCTAssertEqual(values.count, 2)
+        XCTAssertEqual(values[composed.id]?.dataBytes, 100)
+        XCTAssertEqual(values[decomposed.id]?.dataBytes, 900)
+        XCTAssertEqual(values[decomposed.id]?.tableCount, 1)
     }
 }

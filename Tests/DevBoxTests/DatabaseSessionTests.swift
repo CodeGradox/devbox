@@ -261,6 +261,44 @@ struct DatabaseSessionTests {
     }
 
     @Test
+    func databasesDifferingOnlyInUnicodeNormalizationStayDistinctThroughDeletion() async throws {
+        let composed = DatabaseRecord(name: "caf\u{e9}")
+        let decomposed = DatabaseRecord(name: "cafe\u{301}")
+        // MariaDB lists both. Swift equates the names, which used to trap on the duplicate key.
+        #expect(composed.name == decomposed.name)
+        let settings = DatabaseMemorySettings()
+        settings.value.connections = [SavedConnection(name: "Test", settings: .init())]
+        let dropped = Mutex<[String]>([])
+        let store = AppStore(
+            persistence: settings, credentials: DatabaseMemoryCredentials(),
+            dropDatabase: { record, _, _ in dropped.withLock { $0.append(record.id) } },
+            listDatabases: { _, _ in [composed, decomposed] },
+            loadStatistics: { _, _ in [composed.id: databaseEstimate(100), decomposed.id: databaseEstimate(900)] },
+            editorLauncher: inertEditorLauncher(),
+            authenticate: { _ in }
+        )
+        store.loadSelection()
+        let session = try #require(store.selectedDatabaseSession)
+        for await ready in Observations({ session.hasLoadedInventory && !session.statisticsRefreshPending }) {
+            if ready { break }
+        }
+        #expect(store.databases.count == 2)
+        #expect(session.row(id: composed.id)?.statistics?.dataBytes == 100)
+        #expect(session.row(id: decomposed.id)?.statistics?.dataBytes == 900)
+
+        store.databaseSelection = [decomposed.id]
+        #expect(store.selectedDatabases.count == 1)
+        #expect(session.selectedSummary(store.databaseSelection).bytes == 900)
+        store.prepareDeletion()
+        let request = try #require(store.deletionRequest)
+        #expect(request.count == 1)
+        await store.delete(request)
+        #expect(dropped.withLock { $0 } == [decomposed.id])
+        #expect(store.deletionEntries.map(\.state) == [.completed])
+        #expect(store.databases.map(\.id) == [composed.id])
+    }
+
+    @Test
     func completingMetadataDoesNotClearActiveDeletionProgress() async throws {
         let settings = DatabaseMemorySettings()
         settings.value.connections = [SavedConnection(name: "Test", settings: .init())]

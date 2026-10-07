@@ -22,13 +22,28 @@ public struct ConnectionSettings: Codable, Hashable, Sendable {
 
 public struct DatabaseRecord: Identifiable, Hashable, Sendable {
     public let name: String
-    public var id: String { name }
+    /// MariaDB treats names that differ only in Unicode normalization as different databases,
+    /// but Swift equates such Strings, so a dictionary or Set keyed by `name` would merge them
+    /// (or trap on the duplicate). ASCII names are their own id; any other name is spelled out
+    /// scalar by scalar, so equal ids mean identical bytes.
+    public var id: String { Self.identifier(for: name) }
     public var isSystem: Bool {
         ["mysql", "information_schema", "performance_schema", "sys"].contains(name.lowercased())
     }
 
     public init(name: String) {
         self.name = name
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    public func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    static func identifier(for name: String) -> String {
+        guard name.unicodeScalars.contains(where: { !$0.isASCII || $0 == "\\" }) else { return name }
+        return name.unicodeScalars.map { scalar in
+            if scalar == "\\" { return "\\\\" }
+            return scalar.isASCII ? String(scalar) : "\\u{" + String(scalar.value, radix: 16) + "}"
+        }.joined()
     }
 }
 
@@ -68,13 +83,15 @@ public struct DatabaseStatistics: Equatable, Sendable {
     }
 
     /// A NULL table name is the LEFT JOIN placeholder for an empty visible schema.
+    /// Results are keyed by `DatabaseRecord.id`, never the raw name.
     static func accumulate(_ row: [String?], into values: inout [String: Self]) throws {
         guard row.count == 6, let schema = row[0], !schema.isEmpty else {
             throw DatabaseServiceError.invalidResult
         }
-        let old = values[schema] ?? Self(tableCount: 0, viewCount: 0, estimatedRows: 0, dataBytes: 0, indexBytes: 0)
+        let key = DatabaseRecord.identifier(for: schema)
+        let old = values[key] ?? Self(tableCount: 0, viewCount: 0, estimatedRows: 0, dataBytes: 0, indexBytes: 0)
         guard row[1] != nil else {
-            values[schema] = old
+            values[key] = old
             return
         }
         guard let type = row[2] else { throw DatabaseServiceError.invalidResult }
@@ -99,7 +116,7 @@ public struct DatabaseStatistics: Equatable, Sendable {
             data = nil
             indexes = nil
         }
-        values[schema] = Self(
+        values[key] = Self(
             tableCount: tables, viewCount: views,
             estimatedRows: rows, dataBytes: data, indexBytes: indexes
         )
@@ -154,6 +171,13 @@ public enum DatabaseServiceError: LocalizedError, Sendable {
 /// serial queue, never on the main actor or Swift's cooperative executor.
 public struct DatabaseService: Sendable {
     private static let queue = DispatchQueue(label: "DevBox.MariaDB", qos: .utility)
+    /// Seconds to wait for a server reply. Connecting and listing answer at once. The statistics
+    /// query reads INFORMATION_SCHEMA for every table. DROP DATABASE removes every table's files
+    /// before it answers, which takes well over 10 s for a database with a thousand tables, and a
+    /// reply that arrives "late" would otherwise be reported as an uncertain deletion.
+    static let defaultReadTimeout: UInt32 = 10
+    static let statisticsReadTimeout: UInt32 = 60
+    static let dropReadTimeout: UInt32 = 600
 
     public init() {}
 
@@ -200,7 +224,9 @@ public struct DatabaseService: Sendable {
     public func databaseStatistics(settings: ConnectionSettings, password: String) async throws -> [String: DatabaseStatistics] {
         try Self.validate(settings: settings, password: password)
         return try await Self.perform { cancellation in
-            try Self.withConnection(settings: settings, password: password, cancellation: cancellation) { api, connection in
+            try Self.withConnection(
+                settings: settings, password: password, readTimeout: Self.statisticsReadTimeout, cancellation: cancellation
+            ) { api, connection in
                 try cancellation.check()
                 try api.execute("""
                     SELECT s.SCHEMA_NAME, t.TABLE_NAME, t.TABLE_TYPE,
@@ -246,7 +272,9 @@ public struct DatabaseService: Sendable {
         let statement = try Self.dropStatement(database)
         try Self.validate(settings: settings, password: password)
         try await Self.perform { cancellation in
-            try Self.withConnection(settings: settings, password: password, cancellation: cancellation) { api, connection in
+            try Self.withConnection(
+                settings: settings, password: password, readTimeout: Self.dropReadTimeout, cancellation: cancellation
+            ) { api, connection in
                 // Cancellation is honored up to submission. An already submitted DROP
                 // cannot be undone, including if the connection subsequently times out.
                 try cancellation.check()
@@ -317,9 +345,10 @@ public struct DatabaseService: Sendable {
         }
     }
 
-    private static func withConnection<T>(
+    static func withConnection<T>(
         settings: ConnectionSettings,
         password: String,
+        readTimeout: UInt32 = DatabaseService.defaultReadTimeout,
         cancellation: CancellationFlag,
         operation: (MariaDBConnector, OpaquePointer) throws -> T
     ) throws -> T {
@@ -329,8 +358,9 @@ public struct DatabaseService: Sendable {
         guard let connection = api.initialize(nil) else { throw DatabaseServiceError.clientInitialization }
         defer { api.close(connection) }
         // Stable enum values from MariaDB Connector/C's public mysql.h.
-        for option: Int32 in [0, 11, 12] { // CONNECT_TIMEOUT, READ_TIMEOUT, WRITE_TIMEOUT
-            var seconds: UInt32 = 10
+        // CONNECT_TIMEOUT, READ_TIMEOUT, WRITE_TIMEOUT
+        for (option, timeout) in [(0, Self.defaultReadTimeout), (11, readTimeout), (12, Self.defaultReadTimeout)] as [(Int32, UInt32)] {
+            var seconds = timeout
             guard api.options(connection, option, &seconds) == 0 else {
                 throw api.error("Setting connection timeouts", connection)
             }
@@ -369,7 +399,7 @@ public struct DatabaseService: Sendable {
 }
 
 /// The lock protects the sole mutable property; cancellation may arrive on any executor.
-private final class CancellationFlag: @unchecked Sendable {
+final class CancellationFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var cancelled = false
 

@@ -92,7 +92,7 @@ struct DeletionRequest: Identifiable {
         switch items {
         case .worktrees(_, let rows): rows.map { .init(name: $0.worktree.path) }
         case .branches(_, let rows): rows.map { .init(name: $0.reference) }
-        case .databases(_, let rows): rows.map { .init(name: $0.name) }
+        case .databases(_, let rows): rows.map { .init(name: $0.name, identity: $0.id) }
         }
     }
 }
@@ -129,8 +129,10 @@ struct OperationResult: Identifiable {
     let title: String
     let entries: [Entry]
     struct Entry: Identifiable {
-        var id: String { name }
         let name: String
+        /// For items whose name can't tell them apart, such as databases (see `DatabaseRecord.id`).
+        var identity: String?
+        var id: String { identity ?? name }
         var state: DeletionState = .queued
         var startedAt: Date?
         var elapsed: TimeInterval?
@@ -1103,9 +1105,10 @@ final class AppStore {
         deletionEntry(for: name, in: request).state
     }
 
+    /// `name` is the item's id: the path, branch reference or `DatabaseRecord.id`.
     func deletionEntry(for name: String, in request: DeletionRequest) -> OperationResult.Entry {
         guard deletionBatchID == request.id else { return .init(name: name) }
-        return deletionEntries.first { $0.name == name } ?? .init(name: name)
+        return deletionEntries.first { $0.id == name } ?? .init(name: name)
     }
 
     func delete(_ request: DeletionRequest, forceBranches: Bool = false) async {
