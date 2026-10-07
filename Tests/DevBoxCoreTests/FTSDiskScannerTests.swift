@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Synchronization
 import Testing
 @testable import DevBoxCore
 
@@ -152,9 +153,37 @@ func ftsRejectsSymlinkRootWithoutTraversingTarget(suffix: String) throws {
     let fixture = try FTSFixture()
     defer { fixture.cleanup() }
     try fixture.write("a/b/c/payload")
+    try fixture.write("a/d/payload")
     let before = FileManager.default.currentDirectoryPath
-    _ = try FTSDiskScanner.scan(rootPath: fixture.checkout.path)
+    // fts_close restores the directory, so only a look during the walk can tell whether
+    // the traversal changed it (as it would without FTS_NOCHDIR).
+    let seen = Mutex<[String]>([])
+    _ = try FTSDiskScanner.scan(rootPath: fixture.checkout.path) { _ in
+        seen.withLock { $0.append(FileManager.default.currentDirectoryPath) }
+    }
+    #expect(seen.withLock { $0 }.count >= 6)
+    #expect(seen.withLock { Set($0) } == [before])
     #expect(FileManager.default.currentDirectoryPath == before)
+}
+
+@Test func ftsStopsWalkingAsSoonAsItIsCancelled() async throws {
+    let fixture = try FTSFixture()
+    defer { fixture.cleanup() }
+    for index in 0..<200 { try fixture.write("directory-\(index % 10)/file-\(index)") }
+    let rootPath = fixture.checkout.path
+    let lastEntry = Mutex(0)
+    let executor = BlockingIOExecutor(maxConcurrentOperations: 1)
+    await #expect(throws: CancellationError.self) {
+        try await executor.run { cancellation in
+            try FTSDiskScanner.scan(rootPath: rootPath) { visited in
+                lastEntry.withLock { $0 = visited }
+                if visited == 5 { cancellation.cancel() }
+            }
+        }
+    }
+    // Without the per-entry check, the walk would run on through all 210 entries before the
+    // final check reported the cancellation.
+    #expect(lastEntry.withLock { $0 } <= 6)
 }
 
 @Test func ftsThrowsForAlreadyCancelledTask() async throws {

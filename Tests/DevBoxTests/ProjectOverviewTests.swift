@@ -220,6 +220,7 @@ func projectOverviewCachesMetadataChangesOnlyBranchTargetAndRefreshesAllMeasurem
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
             process.arguments = ["-C", repository.path, "-c", "core.hooksPath=/dev/null"] + arguments
+            process.environment = GitService.environment(from: ProcessInfo.processInfo.environment)
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             try process.run()

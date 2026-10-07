@@ -36,7 +36,17 @@ private final class ProfileDelegate: NSObject, NSApplicationDelegate {
         )
         self.project = project
         self.mode = mode
-        store = AppStore(persistence: ProfileSettings(project: project))
+        // The store restores the saved project and would start loading it at once. Give it nothing
+        // to scan, so no Git process runs and the injected session below is all that is measured.
+        store = AppStore(
+            persistence: ProfileSettings(project: project),
+            sizeQueue: WorktreeSizeQueue(
+                scan: { _ in throw CancellationError() },
+                gitStorageScan: { _ in throw CancellationError() }
+            ),
+            inspectBranches: { _, _ in BranchInspection(targetLabel: "main", availableTargets: [], byWorktreeID: [:]) },
+            listWorktrees: { _ in [] }
+        )
         let session = ProjectSessionState()
         let records = (0..<rows).map { index in
             WorktreeRecord(

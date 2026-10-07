@@ -19,7 +19,8 @@ enum FTSDiskScanner {
         rootPath: String,
         excludedDirectoryPath: String? = nil,
         excludedDirectoryPaths: [String] = [],
-        excludeGitEntries: Bool = true
+        excludeGitEntries: Bool = true,
+        entryObserver: ((Int) -> Void)? = nil
     ) throws -> DiskUsage {
         let checkCancellation = BlockingIOExecutor.cancellationCheck()
         try checkCancellation()
@@ -78,6 +79,7 @@ enum FTSDiskScanner {
         var bytes: Int64 = 0
         var files = 0
         var unreadable = 0
+        var visited = 0
         while true {
             try checkCancellation()
             // FTS signals both EOF and failure with nil; errno distinguishes them.
@@ -87,6 +89,8 @@ enum FTSDiskScanner {
                 break
             }
             let kind = Int32(entry.pointee.fts_info)
+            visited += 1
+            entryObserver?(visited) // Lets tests act while the walk is in progress.
             // Only the checkout's own metadata is shared storage. A `.git` deeper down belongs
             // to an independent clone or submodule that disappears with the checkout.
             if excludeGitEntries && entry.pointee.fts_level == 1 && isGitEntry(entry) {

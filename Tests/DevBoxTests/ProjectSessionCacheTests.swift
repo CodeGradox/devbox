@@ -68,12 +68,17 @@ private struct SessionRepositories {
         root = project.appendingPathComponent(".build/test-temp/session-cache-\(UUID())")
         a = root.appendingPathComponent("a")
         b = root.appendingPathComponent("b")
-        for repository in [a, b] {
-            try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
-            try Self.git(["init", "-b", "main"], at: repository)
-            try Self.git(["-c", "user.name=Tests", "-c", "user.email=tests@example.invalid",
-                          "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Initial"],
-                         at: repository)
+        do {
+            for repository in [a, b] {
+                try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+                try Self.git(["init", "-b", "main"], at: repository)
+                try Self.git(["-c", "user.name=Tests", "-c", "user.email=tests@example.invalid",
+                              "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Initial"],
+                             at: repository)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: root)
+            throw error
         }
     }
 
@@ -88,6 +93,7 @@ private struct SessionRepositories {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = ["-C", repository.path, "-c", "core.hooksPath=/dev/null"] + arguments
+        process.environment = GitService.environment(from: ProcessInfo.processInfo.environment)
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()

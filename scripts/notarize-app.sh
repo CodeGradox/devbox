@@ -51,7 +51,10 @@ for variable, filename in [
     ("DEVBOX_CERTIFICATE_BASE64", "certificate.p12"),
     ("DEVBOX_NOTARY_KEY_BASE64", "notary.p8"),
 ]:
-    (directory / filename).write_bytes(base64.b64decode(os.environ[variable], validate=True))
+    # A pasted secret commonly ends in a newline, or is wrapped. Whitespace is not data, but
+    # anything else outside the alphabet still aborts the run.
+    encoded = "".join(os.environ[variable].split())
+    (directory / filename).write_bytes(base64.b64decode(encoded, validate=True))
 # Snapshot before create-keychain, which may itself change the search list.
 # Do not create the snapshot file if inspecting the original list fails.
 original = shlex.split(subprocess.check_output(

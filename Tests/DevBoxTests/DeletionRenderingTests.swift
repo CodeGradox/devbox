@@ -92,8 +92,7 @@ struct DeletionRenderingTests {
         host.layoutSubtreeIfNeeded()
         let bitmap = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
         host.cacheDisplay(in: host.bounds, to: bitmap)
-        #expect(bitmap.pixelsWide > 0)
-        #expect(bitmap.pixelsHigh > 0)
+        expectRendered(bitmap)
         inspect(host)
     }
 }

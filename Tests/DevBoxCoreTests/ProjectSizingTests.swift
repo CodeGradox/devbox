@@ -12,10 +12,15 @@ private struct SizingFixture {
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         root = project.appendingPathComponent(".build/test-temp/project-sizing-\(UUID())")
         repository = root.appendingPathComponent("repo")
-        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
-        try git(["init", "-b", "main"])
-        try git(["-c", "user.name=Tests", "-c", "user.email=tests@example.invalid",
-                 "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Initial"])
+        do {
+            try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+            try git(["init", "-b", "main"])
+            try git(["-c", "user.name=Tests", "-c", "user.email=tests@example.invalid",
+                     "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Initial"])
+        } catch {
+            try? FileManager.default.removeItem(at: root)
+            throw error
+        }
     }
 
     func cleanup() { try? FileManager.default.removeItem(at: root) }

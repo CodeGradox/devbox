@@ -50,7 +50,7 @@ struct BranchRenderingTests {
         host.layoutSubtreeIfNeeded()
         let bitmap = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
         host.cacheDisplay(in: host.bounds, to: bitmap)
-        #expect(bitmap.pixelsWide > 0)
+        expectRendered(bitmap)
     }
 
     @Test(.timeLimit(.minutes(1)), arguments: [false, true])
@@ -132,6 +132,7 @@ struct BranchRenderingTests {
             let bitmap = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
             host.cacheDisplay(in: host.bounds, to: bitmap)
             #expect(bitmap.pixelsWide >= Int(width))
+            expectRendered(bitmap)
             let table = try #require(tables(in: host).first {
                 $0.numberOfRows == branches.count && $0.tableColumns.count == 5
             })
