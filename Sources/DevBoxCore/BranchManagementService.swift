@@ -103,7 +103,7 @@ public struct BranchManagementService: Sendable {
                     _ = try Self.git(project, ["-c", "push.followTags=false", "push",
                         "--porcelain", "--no-verify", "--recurse-submodules=no",
                         "--force-with-lease=\(ref):\(current.commit)", "--", endpoint, ":" + ref],
-                        directory: directory)
+                        directory: directory, interruptible: false)
                 } catch {
                     // The subprocess helper does not expose a structured push result.
                     // Even cancellation can arrive after the server accepted deletion.
@@ -113,16 +113,18 @@ public struct BranchManagementService: Sendable {
                 // ref automatically. Remove only the captured value; a concurrent
                 // fetch/ref change must survive. The server operation is already
                 // confirmed, so a local cleanup failure is not an uncertain push.
-                _ = try? Self.git(project, ["update-ref", "--no-deref", "-d", current.reference, current.commit])
+                _ = try? Self.git(project, ["update-ref", "--no-deref", "-d", current.reference, current.commit], interruptible: false)
             } else {
-                _ = try Self.git(project, ["branch", force ? "-D" : "-d", "--", current.name])
+                _ = try Self.git(project, ["branch", force ? "-D" : "-d", "--", current.name], interruptible: false)
             }
         }
     }
 
-    private static func git(_ project: ProjectRecord, _ args: [String], directory: String? = nil) throws -> String {
+    private static func git(
+        _ project: ProjectRecord, _ args: [String], directory: String? = nil, interruptible: Bool = true
+    ) throws -> String {
         let location = directory.map { ["-C", $0] } ?? []
-        let data = try GitService.git(location + ["--git-dir", project.id] + args)
+        let data = try GitService.git(location + ["--git-dir", project.id] + args, interruptible: interruptible)
         guard let text = String(data: data, encoding: .utf8) else { throw GitServiceError.invalidOutput }
         return text
     }

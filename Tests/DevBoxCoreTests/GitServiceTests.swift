@@ -47,6 +47,19 @@ private struct Fixture {
         try git(["worktree", "add", "-b", branch, url.path])
         return url
     }
+
+    /// A second, independent repository with one commit, next to the main fixture.
+    func otherRepository(_ name: String) throws -> URL {
+        let url = root.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try git(["init", "-b", "main"], at: url)
+        try git(["config", "user.email", "tests@example.invalid"], at: url)
+        try git(["config", "user.name", "DevBox Tests"], at: url)
+        try write("tracked", "original\n", at: url)
+        try git(["add", "."], at: url)
+        try git(["commit", "-m", "Initial"], at: url)
+        return url
+    }
 }
 
 @Test func discoversCommonIdentityAndParsesUnusualWorktreePaths() async throws {
@@ -316,4 +329,200 @@ func diskUsageTraversalIsIndependentOfEntryOrder(linkedCheckout: Bool, linksFirs
         return try await service.diskUsage(worktree: record)
     }
     await #expect(throws: CancellationError.self) { try await scan.value }
+}
+
+private func resolved(_ path: String) -> String {
+    URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+}
+
+@Test func namesBareCloneProjectsAfterTheirFolderNotTheirGitDirectory() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    // The common `proj/.bare` + `.git` pointer-file layout.
+    let project = fixture.root.appendingPathComponent("proj")
+    let bareDirectory = project.appendingPathComponent(".bare")
+    try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+    try fixture.git(["clone", "--bare", fixture.repository.path, bareDirectory.path])
+    try fixture.write(".git", "gitdir: ./.bare\n", at: project)
+    try fixture.git(["worktree", "add", "main", "main"], at: project)
+    let service = GitService()
+    let fromProject = try await service.discoverProject(at: project.path)
+    let fromWorktree = try await service.discoverProject(at: project.appendingPathComponent("main").path)
+    #expect(fromProject.name == "proj")
+    #expect(fromWorktree.name == "proj")
+    #expect(fromProject == fromWorktree)
+    // An ordinary bare repository keeps its own name.
+    let plain = fixture.root.appendingPathComponent("plain.git")
+    try fixture.git(["clone", "--bare", fixture.repository.path, plain.path])
+    #expect(try await service.discoverProject(at: plain.path).name == "plain.git")
+}
+
+@Test func removesWorktreeWhoseBranchNameIsAlsoATag() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    try fixture.git(["tag", "v1"])
+    let linked = try fixture.linked("tagged", branch: "v1")
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let record = try #require(try await service.listWorktrees(project: project).last)
+    #expect(record.branch == "v1")
+    // `rev-parse --abbrev-ref` reports `heads/v1` here, which never matched the listed branch.
+    try await service.remove(worktree: record, project: project, allowDirty: false)
+    #expect(!FileManager.default.fileExists(atPath: linked.path))
+}
+
+@Test func removesOrphanWorktreeWithoutACommit() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let orphan = fixture.root.appendingPathComponent("orphan")
+    try fixture.git(["worktree", "add", "--orphan", "-b", "unborn", orphan.path])
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let record = try #require(try await service.listWorktrees(project: project).last)
+    #expect(record.branch == "unborn")
+    #expect(record.head.allSatisfy { $0 == "0" })
+    try await service.remove(worktree: record, project: project, allowDirty: false)
+    #expect(!FileManager.default.fileExists(atPath: orphan.path))
+}
+
+@Test func forcedRemovalDoesNotDependOnReadingStatus() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let linked = try fixture.linked("damaged-index")
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let record = try #require(try await service.listWorktrees(project: project).last)
+    let index = String(
+        decoding: try GitService.git(["-C", linked.path, "rev-parse", "--path-format=absolute", "--git-path", "index"]),
+        as: UTF8.self
+    ).trimmingCharacters(in: .whitespacesAndNewlines)
+    try Data("not an index".utf8).write(to: URL(fileURLWithPath: index))
+    await #expect(throws: GitServiceError.self) { try await service.status(worktree: record) }
+    // Without the caller's consent the unreadable status still blocks removal.
+    await #expect(throws: GitServiceError.self) {
+        try await service.remove(worktree: record, project: project, allowDirty: false)
+    }
+    #expect(FileManager.default.fileExists(atPath: linked.path))
+    try await service.remove(worktree: record, project: project, allowDirty: true)
+    #expect(!FileManager.default.fileExists(atPath: linked.path))
+}
+
+@Test func removesCleanWorktreeContainingSubmoduleWithoutConsentToDirtyChanges() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let source = try fixture.otherRepository("submodule-source")
+    let superproject = try fixture.otherRepository("superproject")
+    try fixture.git(["-c", "protocol.file.allow=always", "submodule", "add", "--", source.path, "sm"], at: superproject)
+    try fixture.git(["commit", "-m", "Add submodule"], at: superproject)
+    let linked = fixture.root.appendingPathComponent("with-submodule")
+    try fixture.git(["worktree", "add", "-b", "feature", linked.path], at: superproject)
+    try fixture.git(["-c", "protocol.file.allow=always", "submodule", "update", "--init"], at: linked)
+    let service = GitService()
+    let project = try await service.discoverProject(at: superproject.path)
+    let record = try #require(try await service.listWorktrees(project: project).last)
+    // Git itself refuses this without --force, even though nothing is uncommitted.
+    try await service.remove(worktree: record, project: project, allowDirty: false)
+    #expect(!FileManager.default.fileExists(atPath: linked.path))
+}
+
+@Test func dirtySubmoduleWorktreeIsStillProtectedWithoutConsent() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let source = try fixture.otherRepository("submodule-source")
+    let superproject = try fixture.otherRepository("superproject")
+    try fixture.git(["-c", "protocol.file.allow=always", "submodule", "add", "--", source.path, "sm"], at: superproject)
+    try fixture.git(["commit", "-m", "Add submodule"], at: superproject)
+    let linked = fixture.root.appendingPathComponent("with-submodule")
+    try fixture.git(["worktree", "add", "-b", "feature", linked.path], at: superproject)
+    try fixture.git(["-c", "protocol.file.allow=always", "submodule", "update", "--init"], at: linked)
+    try fixture.write("unsaved", "work", at: linked)
+    let service = GitService()
+    let project = try await service.discoverProject(at: superproject.path)
+    let record = try #require(try await service.listWorktrees(project: project).last)
+    await #expect(throws: GitServiceError.self) {
+        try await service.remove(worktree: record, project: project, allowDirty: false)
+    }
+    #expect(FileManager.default.fileExists(atPath: linked.appendingPathComponent("unsaved").path))
+}
+
+@Test func reportsTheCheckoutOfAMainWorktreeWithSeparateGitDirectory() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let metadata = fixture.root.appendingPathComponent("separate-metadata")
+    try fixture.git(["init", "--separate-git-dir", metadata.path])
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let main = try #require(try await service.listWorktrees(project: project).first)
+    // Git lists the metadata directory here, which is not a work tree.
+    #expect(resolved(main.path) == resolved(fixture.repository.path))
+    #expect(main.isMain)
+    #expect(try await service.status(worktree: main).isClean)
+    #expect(try await service.diskUsage(worktree: main).fileCount == 2)
+    #expect(try await service.gitStorageUsage(project: project).fileCount > 0)
+}
+
+@Test func reportsTheCheckoutOfASubmoduleEvenWithoutADiscoveryPath() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let source = try fixture.otherRepository("submodule-source")
+    let superproject = try fixture.otherRepository("superproject")
+    try fixture.git(["-c", "protocol.file.allow=always", "submodule", "add", "--", source.path, "sm"], at: superproject)
+    let checkout = superproject.appendingPathComponent("sm")
+    let service = GitService()
+    let project = try await service.discoverProject(at: checkout.path)
+    let main = try #require(try await service.listWorktrees(project: project).first)
+    #expect(resolved(main.path) == resolved(checkout.path))
+    // `core.worktree` in the module's Git directory still identifies it.
+    let stale = ProjectRecord(id: project.id, name: project.name, path: "/does/not/exist")
+    let fromConfig = try #require(try await service.listWorktrees(project: stale).first)
+    #expect(resolved(fromConfig.path) == resolved(checkout.path))
+    #expect(try await service.status(worktree: fromConfig).isClean)
+}
+
+@Test func gitEnvironmentFindsHelpersOutsideALauncherPathAndDropsGitVariables() {
+    let launcher = GitService.environment(from: [
+        "PATH": "/usr/bin:/bin", "HOME": "/Users/test", "GIT_DIR": "/elsewhere", "GIT_INDEX_FILE": "/x"
+    ])
+    #expect(launcher["PATH"] == "/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")
+    #expect(launcher["HOME"] == "/Users/test")
+    #expect(launcher["GIT_DIR"] == nil)
+    #expect(launcher["GIT_INDEX_FILE"] == nil)
+    #expect(launcher["GIT_TERMINAL_PROMPT"] == "0")
+    #expect(launcher["LC_ALL"] == "C")
+    // A shell-launched app keeps its own order, and nothing is added twice.
+    let shell = GitService.environment(from: ["PATH": "/opt/homebrew/bin:/usr/bin:/usr/local/bin"])
+    #expect(shell["PATH"] == "/opt/homebrew/bin:/usr/bin:/usr/local/bin")
+    #expect(GitService.environment(from: [:])["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin")
+}
+
+@Test func cancellingTerminatesAHungGitInsteadOfPinningItsWorker() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    // A file system monitor hook that never answers makes `git status` block indefinitely.
+    // Git runs the configured command through a shell, so keep its path free of spaces.
+    let scripts = FileManager.default.temporaryDirectory.appendingPathComponent("devbox-hook-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: scripts) }
+    let started = scripts.appendingPathComponent("started")
+    let hook = scripts.appendingPathComponent("hang.sh")
+    try Data("#!/bin/sh\ntouch \(started.path)\nexec sleep 30\n".utf8).write(to: hook)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+    try fixture.git(["config", "core.fsmonitor", hook.path])
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let record = try #require(try await service.listWorktrees(project: project).first)
+
+    let status = Task { try await service.status(worktree: record) }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+    while !FileManager.default.fileExists(atPath: started.path), ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    try #require(FileManager.default.fileExists(atPath: started.path), "Git never ran the hook")
+    let cancelledAt = ContinuousClock.now
+    status.cancel()
+    await #expect(throws: CancellationError.self) { try await status.value }
+    #expect(cancelledAt.duration(to: .now) < .seconds(10))
+    // The worker is free again: a healthy command isn't queued behind the dead one.
+    try fixture.git(["config", "--unset", "core.fsmonitor"])
+    #expect(try await service.status(worktree: record).isClean)
 }

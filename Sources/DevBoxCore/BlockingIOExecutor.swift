@@ -25,11 +25,43 @@ final class BlockingIOExecutor: Sendable {
     }
 
     final class Cancellation: Sendable {
-        private let cancelled = Mutex(false)
+        private struct State: Sendable {
+            var cancelled = false
+            var nextHandlerID = 0
+            var handlers: [Int: @Sendable () -> Void] = [:]
+        }
 
-        func cancel() { cancelled.withLock { $0 = true } }
+        private let state = Mutex(State())
+
+        func cancel() {
+            let handlers = state.withLock { state -> [@Sendable () -> Void] in
+                state.cancelled = true
+                defer { state.handlers = [:] }
+                return Array(state.handlers.values)
+            }
+            for handler in handlers { handler() }
+        }
+
         func check() throws {
-            if cancelled.withLock({ $0 }) { throw CancellationError() }
+            if state.withLock({ $0.cancelled }) { throw CancellationError() }
+        }
+
+        /// Lets a blocked worker be woken by cancellation, for example by terminating
+        /// the child process it waits on. Runs immediately if already canceled. Call the
+        /// returned closure once the wait ends so a late cancel doesn't act on a finished job.
+        func onCancel(_ handler: @escaping @Sendable () -> Void) -> @Sendable () -> Void {
+            let registration: Int? = state.withLock { state in
+                guard !state.cancelled else { return nil }
+                let id = state.nextHandlerID
+                state.nextHandlerID += 1
+                state.handlers[id] = handler
+                return id
+            }
+            guard let registration else {
+                handler()
+                return {}
+            }
+            return { [self] in state.withLock { _ = $0.handlers.removeValue(forKey: registration) } }
         }
     }
 
@@ -93,7 +125,12 @@ final class BlockingIOExecutor: Sendable {
 
     static func checkCancellation() throws {
         try Task.checkCancellation()
-        try (Thread.current.threadDictionary[cancellationKey] as? Cancellation)?.check()
+        try currentCancellation?.check()
+    }
+
+    /// The token of the job running on this worker thread, if any.
+    static var currentCancellation: Cancellation? {
+        Thread.current.threadDictionary[cancellationKey] as? Cancellation
     }
 
     /// Capture the worker's token once for a hot traversal loop, rather than

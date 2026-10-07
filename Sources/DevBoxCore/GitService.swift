@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 
 public struct ProjectRecord: Codable, Hashable, Identifiable, Sendable {
     public let id: String
@@ -92,7 +93,7 @@ public enum GitServiceError: Error, LocalizedError, Sendable {
         case .invalidOutput: return "Git returned an unsupported or invalid response."
         case .protectedWorktree(let reason): return "Cannot remove this worktree: \(reason)."
         case .changedWorktree: return "The worktree registration, branch, or HEAD changed. Refresh before removing it."
-        case .dirtyWorktree: return "The worktree contains uncommitted changes."
+        case .dirtyWorktree: return "The worktree contains uncommitted changes. Refresh and review it before deleting."
         }
     }
 }
@@ -110,7 +111,8 @@ public struct GitService: Sendable {
             let bare = try Self.line(Self.git(["-C", anchor, "rev-parse", "--is-bare-repository"])) == "true"
             let root = bare ? anchor : try Self.line(Self.git(["-C", anchor, "rev-parse", "--show-toplevel"]))
             let nameURL = URL(fileURLWithPath: id)
-            let name = nameURL.lastPathComponent == ".git"
+            // `.bare` is the conventional Git directory of a bare clone with a `.git` pointer file.
+            let name = Self.anonymousGitDirectoryNames.contains(nameURL.lastPathComponent)
                 ? nameURL.deletingLastPathComponent().lastPathComponent : nameURL.lastPathComponent
             return ProjectRecord(id: id, name: name, path: Self.canonical(root))
         }
@@ -174,19 +176,28 @@ public struct GitService: Sendable {
             // Ensure a replaced directory is still the registered checkout of this repository.
             let common = try Self.line(Self.git(["-C", current.path, "rev-parse", "--path-format=absolute", "--git-common-dir"]))
             let root = try Self.line(Self.git(["-C", current.path, "rev-parse", "--show-toplevel"]))
-            let head = try Self.line(Self.git(["-C", current.path, "rev-parse", "HEAD"]))
-            let branchRef = try Self.line(Self.git(["-C", current.path, "rev-parse", "--abbrev-ref", "HEAD"]))
+            let head = try Self.currentHead(at: current.path, listed: current.head)
+            let branch = try Self.currentBranch(at: current.path)
             guard Self.canonical(common) == Self.canonical(project.id),
                   Self.canonical(root) == Self.canonical(current.path),
-                  head == current.head, (branchRef == "HEAD" ? nil : branchRef) == current.branch else {
+                  head == current.head, branch == current.branch else {
                 throw GitServiceError.changedWorktree
             }
-            let status = try Self.readStatus(current.path)
-            guard allowDirty || status.isClean else { throw GitServiceError.dirtyWorktree }
+            // Only a caller that hasn't accepted uncommitted changes needs the live status.
+            // Reading it is otherwise a needless way for removal to fail.
+            if !allowDirty {
+                guard try Self.readStatus(current.path).isClean else { throw GitServiceError.dirtyWorktree }
+            }
             var args = ["--git-dir", project.id, "worktree", "remove"]
-            if allowDirty { args.append("--force") }
+            // Git refuses even a clean worktree that contains submodules without --force.
+            // Dirtiness was already ruled out above or accepted by the caller.
+            let hasSubmodules = FileManager.default.fileExists(
+                atPath: URL(fileURLWithPath: current.path).appendingPathComponent(".gitmodules").path
+            )
+            if allowDirty || hasSubmodules { args.append("--force") }
             args += ["--", current.path]
-            _ = try Self.git(args)
+            // Never interrupt a removal midway: a half-deleted worktree is worse than a slow one.
+            _ = try Self.git(args, interruptible: false)
         }
     }
 
@@ -206,14 +217,17 @@ public struct GitService: Sendable {
         var result: [WorktreeRecord] = []
         var fields: [String: String] = [:]
         func append() throws {
-            guard let path = fields["worktree"] else { throw GitServiceError.invalidOutput }
+            guard let listed = fields["worktree"] else { throw GitServiceError.invalidOutput }
+            let isMain = result.isEmpty
+            let isBare = fields["bare"] != nil
+            let path = isMain && !isBare ? mainCheckout(listed: listed, project: project) : listed
             let ref = fields["branch"]
             let branch = ref.map { $0.hasPrefix("refs/heads/") ? String($0.dropFirst(11)) : $0 }
             var directory: ObjCBool = false
             let exists = FileManager.default.fileExists(atPath: path, isDirectory: &directory) && directory.boolValue
             result.append(WorktreeRecord(
                 path: path, branch: branch, head: fields["HEAD"] ?? "",
-                isMain: result.isEmpty, isBare: fields["bare"] != nil,
+                isMain: isMain, isBare: isBare,
                 isLocked: fields["locked"] != nil, lockReason: fields["locked"].flatMap { $0.isEmpty ? nil : $0 },
                 isPrunable: fields["prunable"] != nil, pruneReason: fields["prunable"].flatMap { $0.isEmpty ? nil : $0 },
                 exists: exists
@@ -245,6 +259,52 @@ public struct GitService: Sendable {
                 isPrunable: record.isPrunable, pruneReason: record.pruneReason, exists: record.exists,
                 nestedWorktreePaths: nested, canonicalPath: roots[index]
             )
+        }
+    }
+
+    /// Git lists the main worktree as the Git directory itself unless that directory is
+    /// `<checkout>/.git`, as with submodules, `--separate-git-dir` and a symlinked `.git`.
+    /// Recover the checkout from `core.worktree`, or from the discovery path when it is
+    /// the main checkout. Otherwise keep Git's answer.
+    private static func mainCheckout(listed: String, project: ProjectRecord) -> String {
+        guard canonical(listed) == canonical(project.id) else { return listed }
+        if let configured = try? line(git(["--git-dir", project.id, "config", "--get", "core.worktree"])),
+           !configured.isEmpty {
+            let base = URL(fileURLWithPath: project.id, isDirectory: true)
+            let checkout = URL(fileURLWithPath: configured, relativeTo: base).standardizedFileURL.path
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: checkout, isDirectory: &isDirectory), isDirectory.boolValue {
+                return checkout
+            }
+        }
+        // The Git directory of a linked worktree is a subdirectory of the common one.
+        if let gitDirectory = try? line(git(["-C", project.path, "rev-parse", "--absolute-git-dir"])),
+           canonical(gitDirectory) == canonical(project.id) {
+            return project.path
+        }
+        return listed
+    }
+
+    private static func currentBranch(at path: String) throws -> String? {
+        let result = try run(["-C", path, "symbolic-ref", "--quiet", "HEAD"])
+        switch result.status {
+        case 0:
+            // Not `rev-parse --abbrev-ref`: it prints `heads/x` when a tag is also named `x`.
+            let ref = try line(result.output)
+            return ref.hasPrefix("refs/heads/") ? String(ref.dropFirst(11)) : ref
+        case 1: return nil // Detached HEAD.
+        default: throw GitServiceError.git(result.message)
+        }
+    }
+
+    private static func currentHead(at path: String, listed: String) throws -> String {
+        let result = try run(["-C", path, "rev-parse", "--verify", "--quiet", "HEAD"])
+        switch result.status {
+        case 0: return try line(result.output)
+        // An unborn branch, such as a `git worktree add --orphan` checkout, has no commit.
+        // Git lists it with the all-zero object ID.
+        case 1: return String(repeating: "0", count: listed.count)
+        default: throw GitServiceError.git(result.message)
         }
     }
 
@@ -297,17 +357,48 @@ public struct GitService: Sendable {
         }
     }
 
-    static func git(_ arguments: [String]) throws -> Data {
-        try BlockingIOExecutor.checkCancellation()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        var environment = ProcessInfo.processInfo.environment
+    /// Directories GUI apps don't have on PATH but where Git's filter and hook helpers
+    /// (git-lfs, git-crypt, ...) usually live. Appended so system tools keep precedence.
+    private static let supplementalPath = ["/opt/homebrew/bin", "/usr/local/bin"]
+
+    /// Git directory names that say nothing about the project they belong to.
+    private static let anonymousGitDirectoryNames: Set<String> = [".git", ".bare"]
+
+    static func environment(from base: [String: String]) -> [String: String] {
+        var environment = base
         // Do not let an inherited shell's repository override explicit selections.
         for key in environment.keys where key.hasPrefix("GIT_") { environment.removeValue(forKey: key) }
         environment["GIT_TERMINAL_PROMPT"] = "0"
         environment["LC_ALL"] = "C"
-        process.environment = environment
+        // A Finder or Dock launch inherits launchd's minimal PATH, so a repository's
+        // `filter.lfs.*` commands would otherwise fail to start.
+        var path = (base["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin").split(separator: ":").map(String.init)
+        for directory in supplementalPath where !path.contains(directory) { path.append(directory) }
+        environment["PATH"] = path.joined(separator: ":")
+        return environment
+    }
+
+    struct GitOutput {
+        let status: Int32
+        let output: Data
+        let message: String
+    }
+
+    static func git(_ arguments: [String], interruptible: Bool = true) throws -> Data {
+        let result = try run(arguments, interruptible: interruptible)
+        guard result.status == 0 else { throw GitServiceError.git(result.message) }
+        return result.output
+    }
+
+    /// Reports Git's exit status instead of throwing for commands whose failure is an answer.
+    /// An interruptible command is terminated when its job is canceled, so a hung child
+    /// can't pin a worker. Destructive commands pass `false` and always run to completion.
+    static func run(_ arguments: [String], interruptible: Bool = true) throws -> GitOutput {
+        try BlockingIOExecutor.checkCancellation()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = arguments
+        process.environment = environment(from: ProcessInfo.processInfo.environment)
         let output = Pipe()
         let errors = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
         guard FileManager.default.createFile(atPath: errors.path, contents: nil) else {
@@ -321,12 +412,34 @@ public struct GitService: Sendable {
         process.standardInput = FileHandle.nullDevice
         try BlockingIOExecutor.checkCancellation()
         try process.run()
+        let child = ChildProcess(process)
+        let stopWatching = interruptible
+            ? BlockingIOExecutor.currentCancellation?.onCancel { child.terminate() } : nil
         let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let message = (try? String(contentsOf: errors, encoding: .utf8)) ?? "Git failed."
-            throw GitServiceError.git(message.trimmingCharacters(in: .whitespacesAndNewlines))
+        stopWatching?()
+        if child.wasTerminated, process.terminationStatus != 0 { throw CancellationError() }
+        let message = process.terminationStatus == 0
+            ? "" : ((try? String(contentsOf: errors, encoding: .utf8)) ?? "Git failed.")
+        return GitOutput(
+            status: process.terminationStatus, output: data,
+            message: message.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    /// Cancellation arrives on an arbitrary thread while the worker blocks reading the child's output.
+    private final class ChildProcess: @unchecked Sendable {
+        private let process: Process
+        private let terminated = Mutex(false)
+
+        init(_ process: Process) { self.process = process }
+
+        var wasTerminated: Bool { terminated.withLock { $0 } }
+
+        func terminate() {
+            guard process.isRunning else { return }
+            terminated.withLock { $0 = true }
+            process.terminate()
         }
-        return data
     }
 }

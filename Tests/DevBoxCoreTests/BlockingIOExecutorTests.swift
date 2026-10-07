@@ -194,4 +194,50 @@ struct BlockingIOExecutorTests {
         let next = try await executor.run { _ in 123 }
         #expect(next == 123)
     }
+
+    @Test
+    func cancellationWakesAWorkerBlockedOnSomethingElse() async throws {
+        let executor = BlockingIOExecutor(maxConcurrentOperations: 1)
+        let gate = IOGate()
+        let task = Task {
+            try await executor.run { cancellation in
+                // Stands in for a worker waiting on a child process's output.
+                let stopWatching = cancellation.onCancel { gate.release() }
+                defer { stopWatching() }
+                gate.block()
+                try cancellation.check()
+            }
+        }
+        await gate.waitForArrivals(1)
+        task.cancel()
+        do {
+            try await task.value
+            Issue.record("The blocked worker must observe cancellation")
+        } catch is CancellationError {}
+        // The slot is free again for unrelated work.
+        #expect(try await executor.run { _ in 7 } == 7)
+    }
+
+    @Test
+    func cancellationHandlersRunOnceAndNotAfterRemoval() {
+        let cancellation = BlockingIOExecutor.Cancellation()
+        let calls = Mutex(0)
+        let removed = Mutex(0)
+        _ = cancellation.onCancel { calls.withLock { $0 += 1 } }
+        cancellation.onCancel { removed.withLock { $0 += 1 } }()
+        cancellation.cancel()
+        cancellation.cancel()
+        #expect(calls.withLock { $0 } == 1)
+        #expect(removed.withLock { $0 } == 0)
+    }
+
+    @Test
+    func handlerRegisteredAfterCancellationRunsImmediately() {
+        let cancellation = BlockingIOExecutor.Cancellation()
+        cancellation.cancel()
+        let calls = Mutex(0)
+        _ = cancellation.onCancel { calls.withLock { $0 += 1 } }
+        #expect(calls.withLock { $0 } == 1)
+        #expect(throws: CancellationError.self) { try cancellation.check() }
+    }
 }
