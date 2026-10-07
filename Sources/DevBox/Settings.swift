@@ -106,17 +106,25 @@ struct SettingsStore: SettingsPersisting {
 
 struct CredentialStore: PasswordCredentialBackend {
     private static let service = "app.devbox.mariadb"
+    /// Adds attributes to every query. Tests use it to target a throwaway keychain.
+    private let scope: @Sendable (inout [String: Any]) -> Void
 
-    private static func query(_ id: UUID) -> [String: Any] {
-        [
+    init(scope: @escaping @Sendable (inout [String: Any]) -> Void = { _ in }) {
+        self.scope = scope
+    }
+
+    private func query(_ id: UUID) -> [String: Any] {
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
+            kSecAttrService as String: Self.service,
             kSecAttrAccount as String: id.uuidString
         ]
+        scope(&query)
+        return query
     }
 
     func password(for id: UUID) throws -> String? {
-        var query = Self.query(id)
+        var query = query(id)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
@@ -131,21 +139,35 @@ struct CredentialStore: PasswordCredentialBackend {
 
     func save(password: String, for id: UUID) throws {
         let data = Data(password.utf8)
-        let query = Self.query(id)
+        let query = query(id)
+        if data.isEmpty {
+            // SecItemUpdate reports success for empty data but keeps the old secret, so a
+            // cleared password would silently survive. Replace the item instead.
+            let status = SecItemDelete(query as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw KeychainError(status: status)
+            }
+            try add(query, data)
+            return
+        }
         let update = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
         if update == errSecItemNotFound {
-            var item = query
-            item[kSecValueData as String] = data
-            item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-            let status = SecItemAdd(item as CFDictionary, nil)
-            guard status == errSecSuccess else { throw KeychainError(status: status) }
+            try add(query, data)
         } else if update != errSecSuccess {
             throw KeychainError(status: update)
         }
     }
 
+    private func add(_ query: [String: Any], _ data: Data) throws {
+        var item = query
+        item[kSecValueData as String] = data
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        let status = SecItemAdd(item as CFDictionary, nil)
+        guard status == errSecSuccess else { throw KeychainError(status: status) }
+    }
+
     func remove(for id: UUID) throws {
-        let status = SecItemDelete(Self.query(id) as CFDictionary)
+        let status = SecItemDelete(query(id) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError(status: status)
         }
