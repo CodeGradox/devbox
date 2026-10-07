@@ -161,6 +161,51 @@ func installedZedIsOnlyAnUnpersistedInitialDefault() async {
     #expect(fixture.makeStore().preferredEditor == fixture.generic)
 }
 
+private func archiveUtility() -> EditorApplication {
+    EditorApplication(
+        url: URL(fileURLWithPath: "/editor-tests/Archive Utility.app"),
+        name: "Archive Utility", bundleIdentifier: "com.apple.archiveutility"
+    )
+}
+
+@Test @MainActor
+func openWithListOmitsArchiveUtilityBecauseItWritesAnArchiveInsteadOfOpening() {
+    let fixture = EditorPreferenceFixture()
+    let archiver = archiveUtility()
+    fixture.installed = [fixture.zed, archiver, fixture.generic]
+    fixture.advertised = [archiver, fixture.zed, fixture.generic]
+    let store = fixture.makeStore()
+    #expect(archiver.archivesFolders)
+    #expect(!fixture.zed.archivesFolders)
+    #expect(store.editorApplications.map(\.name) == ["Writer", "Zed"])
+}
+
+@Test @MainActor
+func savedArchiveUtilityPreferenceFallsBackWithoutRewritingSettings() async {
+    let fixture = EditorPreferenceFixture()
+    let archiver = archiveUtility()
+    fixture.installed = [fixture.zed, archiver]
+    fixture.advertised = [archiver, fixture.zed]
+    fixture.persistence.value.preferredEditor = archiver
+    let store = fixture.makeStore()
+    #expect(store.preferredEditor == fixture.zed)
+    #expect(store.openInEditorTitle == "Open in Zed")
+    await store.openInEditor(fixture.ids)
+    #expect(fixture.launches.map(\.application) == [fixture.zed])
+    #expect(fixture.persistence.writes == 0)
+    #expect(fixture.persistence.value.preferredEditor == archiver)
+
+    // With nothing else to fall back to, the toolbar asks instead of archiving.
+    let bare = EditorPreferenceFixture()
+    bare.installed = [archiver]
+    bare.advertised = [archiver]
+    bare.persistence.value.preferredEditor = archiver
+    let bareStore = bare.makeStore()
+    #expect(bareStore.preferredEditor == nil)
+    #expect(bareStore.openInEditorTitle == "Open in Editor…")
+    #expect(bareStore.editorApplications.isEmpty)
+}
+
 @Test @MainActor
 func failedEditorLaunchDoesNotChangePreference() async {
     let fixture = EditorPreferenceFixture()

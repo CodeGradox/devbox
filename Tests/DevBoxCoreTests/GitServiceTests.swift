@@ -210,10 +210,38 @@ func diskUsageTraversalIsIndependentOfEntryOrder(linkedCheckout: Bool, linksFirs
         )
         addedBytes += Int64(try #require(values.totalFileAllocatedSize ?? values.fileAllocatedSize))
     }
+    // A .git below the checkout's root belongs to an independent clone and is its own storage.
+    let nestedMetadata = ["nested-file/.git", "nested-directory/.git/objects/payload"]
+    for path in nestedMetadata {
+        let values = try checkout.appendingPathComponent(path).resourceValues(
+            forKeys: [.totalFileAllocatedSizeKey, .fileAllocatedSizeKey]
+        )
+        addedBytes += Int64(try #require(values.totalFileAllocatedSize ?? values.fileAllocatedSize))
+    }
     let usage = try await service.diskUsage(worktree: record)
-    #expect(usage.fileCount == initial.fileCount + paths.count)
+    #expect(usage.fileCount == initial.fileCount + paths.count + nestedMetadata.count)
     #expect(usage.bytes == initial.bytes + addedBytes)
     #expect(usage.unreadableCount == 0)
+}
+
+@Test func diskUsageCountsAnIndependentNestedCloneIncludingItsGitStorage() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let record = try #require(try await service.listWorktrees(project: project).first)
+    let before = try await service.diskUsage(worktree: record)
+    // A full clone inside the checkout, as a vendored dependency would be.
+    let nested = fixture.repository.appendingPathComponent("vendor/dep")
+    try fixture.git(["clone", fixture.repository.path, nested.path])
+    try fixture.write("vendor/dep/payload", String(repeating: "dependency", count: 4096))
+    let expected = try FTSDiskScanner.scan(rootPath: nested.path, excludeGitEntries: false)
+    #expect(expected.fileCount > 3) // Its .git directory has real content.
+    let after = try await service.diskUsage(worktree: record)
+    #expect(after.fileCount == before.fileCount + expected.fileCount)
+    #expect(after.bytes == before.bytes + expected.bytes)
+    // The checkout's own metadata is still shared storage, counted once, elsewhere.
+    #expect(try await service.gitStorageUsage(project: project).fileCount > 0)
 }
 
 @Test func deletionRechecksLockDirtyStateAndAllowsExplicitForce() async throws {

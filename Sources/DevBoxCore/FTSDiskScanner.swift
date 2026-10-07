@@ -87,7 +87,9 @@ enum FTSDiskScanner {
                 break
             }
             let kind = Int32(entry.pointee.fts_info)
-            if excludeGitEntries && isGitEntry(entry) {
+            // Only the checkout's own metadata is shared storage. A `.git` deeper down belongs
+            // to an independent clone or submodule that disappears with the checkout.
+            if excludeGitEntries && entry.pointee.fts_level == 1 && isGitEntry(entry) {
                 if kind == FTS_D { fts_set(tree, entry, FTS_SKIP) }
                 continue
             }

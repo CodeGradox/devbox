@@ -7,6 +7,9 @@ struct EditorApplication: Codable, Hashable, Identifiable {
     let bundleIdentifier: String?
 
     var id: URL { url }
+
+    /// Registers for folders, but "opens" one by writing a `.cpgz` archive of it beside the folder.
+    var archivesFolders: Bool { bundleIdentifier == "com.apple.archiveutility" }
 }
 
 /// Discovers native folder handlers and opens folders without command-line tools.
@@ -57,7 +60,7 @@ struct EditorLauncher {
     func applicationsForFolders() -> [EditorApplication] {
         var seen: Set<URL> = []
         return findApplications().compactMap { url in
-            guard let application = application(at: url),
+            guard let application = application(at: url), !application.archivesFolders,
                   seen.insert(application.url.standardizedFileURL).inserted else { return nil }
             return application
         }.sorted { lhs, rhs in

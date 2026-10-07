@@ -388,7 +388,9 @@ final class AppStore {
     /// Discover outside view bodies, at launch and when returning to DevBox.
     /// A manually chosen app remains available even if it does not advertise folder support.
     func refreshEditorApplications() {
-        if let saved = settings.preferredEditor {
+        // A preference saved before Archive Utility was filtered out of the menu is ignored,
+        // not rewritten, so the toolbar can't keep archiving folders.
+        if let saved = settings.preferredEditor, !saved.archivesFolders {
             preferredEditor = editorLauncher.resolvedApplication(saved) ?? saved
         } else {
             preferredEditor = editorLauncher.application(withBundleIdentifier: "dev.zed.Zed")

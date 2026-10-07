@@ -92,11 +92,12 @@ private struct FTSFixture {
         fixture.write(".hidden"),
         fixture.write("nested/line\n tab\t quote\" apostrophe' emoji🦊"),
         fixture.write("nested/.gitkeep"),
-        fixture.write("other/shared-metadata/payload")
+        fixture.write("other/shared-metadata/payload"),
+        // Only the checkout's own metadata is shared. An independent clone's .git is its own storage.
+        fixture.write("nested/.git/objects/included"),
+        fixture.write("regular-entry/.git")
     ] + [ignore]
     try fixture.write(".git/objects/excluded")
-    try fixture.write("nested/.git/objects/excluded")
-    try fixture.write("regular-entry/.git")
     try fixture.write("shared-metadata/objects/excluded")
     let metadata = fixture.checkout.appendingPathComponent("shared-metadata")
     let usage = try FTSDiskScanner.scan(
@@ -190,4 +191,23 @@ func ftsRejectsSymlinkRootWithoutTraversingTarget(suffix: String) throws {
     #expect(usage.fileCount == 1)
     #expect(usage.bytes == (try fixture.allocatedBytes([readable])))
     #expect(usage.unreadableCount > 0)
+}
+
+@Test func ftsSkipsOnlyTheScanRootsOwnGitEntry() throws {
+    let fixture = try FTSFixture()
+    defer { fixture.cleanup() }
+    try fixture.write(".git/objects/shared")
+    let counted = try [
+        fixture.write("vendor/dep/.git/objects/own-storage"),
+        fixture.write("vendor/dep/.git/HEAD"),
+        fixture.write("vendor/dep/source")
+    ]
+    let usage = try FTSDiskScanner.scan(rootPath: fixture.checkout.path)
+    #expect(usage.fileCount == counted.count)
+    #expect(usage.bytes == (try fixture.allocatedBytes(counted)))
+    // Repository storage is measured from the Git directory itself, where nothing is skipped.
+    let storage = try FTSDiskScanner.scan(
+        rootPath: fixture.checkout.appendingPathComponent(".git").path, excludeGitEntries: false
+    )
+    #expect(storage.fileCount == 1)
 }
