@@ -82,8 +82,8 @@ commit/push to `main`, then tag that commit with a fresh stable version:
 
 ```sh
 git switch main
-GIT_EDITOR=true git tag -a v0.5.2 -m "DevBox v0.5.2"
-git push origin refs/tags/v0.5.2
+GIT_EDITOR=true git tag -a v0.5.3 -m "DevBox v0.5.3"
+git push origin refs/tags/v0.5.3
 ```
 
 Use a new version for each release; do not move an existing tag. The workflow
