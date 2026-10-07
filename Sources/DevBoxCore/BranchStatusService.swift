@@ -135,8 +135,10 @@ public struct BranchStatusService: Sendable {
         } else {
             warning = "The main checkout is missing, bare, or has no commits. Select a comparison target."
         }
-        let shallow = try optional { try git(["rev-parse", "--is-shallow-repository"]) }
-        let isShallow = shallow?.trimmingCharacters(in: .newlines) != "false"
+        // What `rev-parse --is-shallow-repository` reports, without spawning Git to read one file.
+        let isShallow = FileManager.default.fileExists(
+            atPath: URL(fileURLWithPath: project.id).appendingPathComponent("shallow").path
+        )
         var merged: [String: String]?
         if let targetHash {
             merged = try optional {

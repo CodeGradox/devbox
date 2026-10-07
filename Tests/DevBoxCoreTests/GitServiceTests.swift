@@ -6,19 +6,25 @@ private struct Fixture {
     let root: URL
     let repository: URL
 
-    init() throws {
+    init(root custom: URL? = nil) throws {
         let project = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        root = project.appendingPathComponent(".build/test-temp/DevBox tests \(UUID().uuidString)")
+        root = custom ?? project.appendingPathComponent(".build/test-temp/DevBox tests \(UUID().uuidString)")
         repository = root.appendingPathComponent("main ' repo\n")
-        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
-        try git(["init", "-b", "main"])
-        try git(["config", "user.email", "tests@example.invalid"])
-        try git(["config", "user.name", "DevBox Tests"])
-        try write("tracked", "original\n")
-        try write(".gitignore", "ignored/\n")
-        try git(["add", "."])
-        try git(["commit", "-m", "Initial"])
+        do {
+            try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+            try git(["init", "-b", "main"])
+            try git(["config", "user.email", "tests@example.invalid"])
+            try git(["config", "user.name", "DevBox Tests"])
+            try write("tracked", "original\n")
+            try write(".gitignore", "ignored/\n")
+            try git(["add", "."])
+            try git(["commit", "-m", "Initial"])
+        } catch {
+            // The caller only registers its cleanup once init has succeeded.
+            try? FileManager.default.removeItem(at: root)
+            throw error
+        }
     }
 
     func cleanup() { try? FileManager.default.removeItem(at: root) }
@@ -33,7 +39,10 @@ private struct Fixture {
     func git(_ arguments: [String], at base: URL? = nil) throws -> Int32 {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["-C", (base ?? repository).path] + arguments
+        // Neither the developer's signing setup, global hooks nor an inherited GIT_DIR may reach a fixture.
+        process.arguments = ["-C", (base ?? repository).path, "-c", "commit.gpgsign=false",
+                             "-c", "core.hooksPath=/dev/null"] + arguments
+        process.environment = GitService.environment(from: ProcessInfo.processInfo.environment)
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()
@@ -523,19 +532,29 @@ private func resolved(_ path: String) -> String {
     #expect(GitService.environment(from: [:])["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin")
 }
 
-@Test func cancellingTerminatesAHungGitInsteadOfPinningItsWorker() async throws {
-    let fixture = try Fixture()
-    defer { fixture.cleanup() }
-    // A file system monitor hook that never answers makes `git status` block indefinitely.
-    // Git runs the configured command through a shell, so keep its path free of spaces.
+/// A file system monitor hook that never answers makes `git status` block indefinitely.
+/// Git runs the configured command through a shell, so its path must be free of spaces.
+private func hangStatus(in fixture: Fixture) throws -> (started: URL, cleanup: () -> Void) {
     let scripts = FileManager.default.temporaryDirectory.appendingPathComponent("devbox-hook-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: scripts) }
     let started = scripts.appendingPathComponent("started")
     let hook = scripts.appendingPathComponent("hang.sh")
     try Data("#!/bin/sh\ntouch \(started.path)\nexec sleep 30\n".utf8).write(to: hook)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
     try fixture.git(["config", "core.fsmonitor", hook.path])
+    return (started, { try? FileManager.default.removeItem(at: scripts) })
+}
+
+private func uuidNamedTemporaryFiles() -> Set<String> {
+    let names = (try? FileManager.default.contentsOfDirectory(atPath: NSTemporaryDirectory())) ?? []
+    return Set(names.filter { UUID(uuidString: $0) != nil })
+}
+
+@Test func cancellingTerminatesAHungGitInsteadOfPinningItsWorker() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let (started, cleanup) = try hangStatus(in: fixture)
+    defer { cleanup() }
     let service = GitService()
     let project = try await service.discoverProject(at: fixture.repository.path)
     let record = try #require(try await service.listWorktrees(project: project).first)
@@ -553,4 +572,109 @@ private func resolved(_ path: String) -> String {
     // The worker is free again: a healthy command isn't queued behind the dead one.
     try fixture.git(["config", "--unset", "core.fsmonitor"])
     #expect(try await service.status(worktree: record).isClean)
+}
+
+@Test func gitErrorTextIsCapturedWithoutLeavingATemporaryFileBehind() async throws {
+    let before = uuidNamedTemporaryFiles()
+    let result = try GitService.run(["-C", "/does/not/exist/devbox", "status"])
+    #expect(result.status != 0)
+    #expect(result.message.contains("/does/not/exist/devbox"))
+    #expect(uuidNamedTemporaryFiles().subtracting(before).isEmpty)
+
+    // The file is gone before the command finishes, so quitting mid-command can't strand it.
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let (started, cleanup) = try hangStatus(in: fixture)
+    defer { cleanup() }
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let record = try #require(try await service.listWorktrees(project: project).first)
+    let running = uuidNamedTemporaryFiles()
+    let status = Task { try await service.status(worktree: record) }
+    let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+    while !FileManager.default.fileExists(atPath: started.path), ContinuousClock.now < deadline {
+        try await Task.sleep(for: .milliseconds(20))
+    }
+    try #require(FileManager.default.fileExists(atPath: started.path), "Git never ran the hook")
+    #expect(uuidNamedTemporaryFiles().subtracting(running).isEmpty)
+    status.cancel()
+    _ = try? await status.value
+}
+
+@Test func canonicalSpellingOfAMissingPathMatchesItsExistingNeighbours() {
+    // Git reports real paths (/private/tmp/...); the canonical spelling drops /private for system
+    // aliases. That must hold whether or not the path exists, or a missing registration stops
+    // matching the existing folders around it.
+    let missing = "/tmp/devbox-missing-\(UUID().uuidString)/nested/child"
+    #expect(GitService.canonical("/private" + missing) == missing)
+    #expect(GitService.canonical(missing) == missing)
+    #expect(GitService.canonical("/private/tmp") == "/tmp")
+    #expect(GitService.canonical("/private/tmp/x/./y") == "/tmp/x/y")
+    #expect(GitService.canonical("/") == "/")
+}
+
+@Test func missingNestedRegistrationUnderTmpStillProtectsItsParent() async throws {
+    let fixture = try Fixture(root: URL(fileURLWithPath: "/tmp/devbox-test-\(UUID().uuidString)"))
+    defer { fixture.cleanup() }
+    let parent = try fixture.linked("parent", branch: "parent")
+    let nested = parent.appendingPathComponent("nested")
+    try fixture.git(["worktree", "add", "-b", "nested", nested.path])
+    try FileManager.default.removeItem(at: nested) // Still registered, but its folder is gone.
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let records = try await service.listWorktrees(project: project)
+    let record = try #require(records.first { $0.branch == "parent" })
+    #expect(records.first { $0.branch == "nested" }?.exists == false)
+    // Deleting the parent would orphan the registration; it must stay protected.
+    #expect(record.nestedWorktreePaths.count == 1)
+    await #expect(throws: GitServiceError.self) {
+        try await service.remove(worktree: record, project: project, allowDirty: true)
+    }
+    #expect(FileManager.default.fileExists(atPath: parent.path))
+}
+
+@Test func sizeScanUsesTheKnownGitDirectoryInsteadOfAskingGitAgain() async throws {
+    let fixture = try Fixture()
+    defer { fixture.cleanup() }
+    let service = GitService()
+    let project = try await service.discoverProject(at: fixture.repository.path)
+    let listed = try #require(try await service.listWorktrees(project: project).first)
+    #expect(listed.commonDirectory != nil)
+    let withKnown = try await service.diskUsage(worktree: listed)
+    #expect(withKnown.fileCount == 2)
+
+    // A folder Git can't run in still measures when the Git directory is already known,
+    // instead of leaving the size column failing. It must lie outside every repository.
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("devbox-plain-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    try fixture.write("payload", "data", at: folder)
+    let metadata = folder.appendingPathComponent("metadata")
+    try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: true)
+    try fixture.write("excluded", "metadata", at: metadata)
+    let known = WorktreeRecord(
+        path: folder.path, branch: nil, head: "", isMain: false, commonDirectory: metadata.path
+    )
+    #expect(try await service.diskUsage(worktree: known).fileCount == 1)
+    let unknown = WorktreeRecord(path: folder.path, branch: nil, head: "", isMain: false)
+    await #expect(throws: GitServiceError.self) { try await service.diskUsage(worktree: unknown) }
+}
+
+@Test func fixtureIgnoresTheDevelopersGitSetupAndAnInheritedGitDir() throws {
+    let fixture = try withHostileGitEnvironment { try Fixture() }
+    defer { fixture.cleanup() }
+    // Another commit under the same hostile setup: signing and the global hook must not apply.
+    try withHostileGitEnvironment {
+        try fixture.git(["commit", "--allow-empty", "-m", "Second"])
+    }
+    #expect(FileManager.default.fileExists(atPath: fixture.repository.appendingPathComponent(".git").path))
+}
+
+@Test func failedFixtureSetupRemovesItsTemporaryDirectory() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("devbox-leak-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    // A file where the repository directory belongs makes setup fail after the root exists.
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try Data().write(to: root.appendingPathComponent("main ' repo\n"))
+    #expect(throws: (any Error).self) { try Fixture(root: root) }
+    #expect(!FileManager.default.fileExists(atPath: root.path))
 }

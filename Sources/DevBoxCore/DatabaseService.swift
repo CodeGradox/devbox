@@ -318,7 +318,9 @@ public struct DatabaseService: Sendable {
         guard !name.isEmpty, !name.utf8.contains(0) else {
             throw DatabaseServiceError.invalidIdentifier
         }
-        return "`" + name.replacingOccurrences(of: "`", with: "``") + "`"
+        // Literal: Foundation's default comparison treats a backtick plus a combining mark as one
+        // character that isn't a backtick, and U+1FEF (canonically a backtick) as one that is.
+        return "`" + name.replacingOccurrences(of: "`", with: "``", options: .literal) + "`"
     }
 
     static func dropStatement(_ database: DatabaseRecord) throws -> String {

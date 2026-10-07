@@ -33,12 +33,14 @@ public struct WorktreeRecord: Identifiable, Hashable, Sendable {
     public let pruneReason: String?
     public let exists: Bool
     public let nestedWorktreePaths: [String]
+    /// The repository's shared Git directory, known from listing. Saves each size scan a `git` spawn.
+    public let commonDirectory: String?
 
     public init(
         path: String, branch: String?, head: String, isMain: Bool,
         isBare: Bool = false, isLocked: Bool = false, lockReason: String? = nil,
         isPrunable: Bool = false, pruneReason: String? = nil, exists: Bool = true,
-        nestedWorktreePaths: [String] = [], canonicalPath: String? = nil
+        nestedWorktreePaths: [String] = [], canonicalPath: String? = nil, commonDirectory: String? = nil
     ) {
         self.path = path
         self.canonicalPath = canonicalPath ?? path
@@ -52,6 +54,7 @@ public struct WorktreeRecord: Identifiable, Hashable, Sendable {
         self.pruneReason = pruneReason
         self.exists = exists
         self.nestedWorktreePaths = nestedWorktreePaths
+        self.commonDirectory = commonDirectory
     }
 
     public func removingNestedWorktrees(at paths: Set<String>) -> Self {
@@ -61,7 +64,7 @@ public struct WorktreeRecord: Identifiable, Hashable, Sendable {
             path: path, branch: branch, head: head, isMain: isMain,
             isBare: isBare, isLocked: isLocked, lockReason: lockReason,
             isPrunable: isPrunable, pruneReason: pruneReason, exists: exists,
-            nestedWorktreePaths: remaining, canonicalPath: canonicalPath
+            nestedWorktreePaths: remaining, canonicalPath: canonicalPath, commonDirectory: commonDirectory
         )
     }
 }
@@ -141,7 +144,7 @@ public struct GitService: Sendable {
             guard rootValues.isSymbolicLink != true, rootValues.isDirectory == true else {
                 return DiskUsage(bytes: 0, fileCount: 0, unreadableCount: 1)
             }
-            let metadata = try Self.canonical(Self.line(Self.git([
+            let metadata = try worktree.commonDirectory ?? Self.canonical(Self.line(Self.git([
                 "-C", worktree.path, "rev-parse", "--path-format=absolute", "--git-common-dir"
             ])))
             return try FTSDiskScanner.scan(
@@ -257,7 +260,8 @@ public struct GitService: Sendable {
                 path: record.path, branch: record.branch, head: record.head, isMain: record.isMain,
                 isBare: record.isBare, isLocked: record.isLocked, lockReason: record.lockReason,
                 isPrunable: record.isPrunable, pruneReason: record.pruneReason, exists: record.exists,
-                nestedWorktreePaths: nested, canonicalPath: roots[index]
+                nestedWorktreePaths: nested, canonicalPath: roots[index],
+                commonDirectory: canonical(project.id)
             )
         }
     }
@@ -336,8 +340,17 @@ public struct GitService: Sendable {
         return GitStatus(staged: staged, modified: modified, untracked: untracked, conflicted: conflicted)
     }
 
-    private static func canonical(_ path: String) -> String {
-        URL(fileURLWithPath: path).standardizedFileURL.resolvingSymlinksInPath().path
+    /// Resolves symlinks, including `/tmp`, `/var` and `/etc`, which are `/private` aliases, even
+    /// when the path itself is gone: a missing registered worktree must keep the same spelling as
+    /// the folders around it, or it stops being recognised as nested in them.
+    static func canonical(_ path: String) -> String {
+        var existing = URL(fileURLWithPath: path).standardizedFileURL
+        var missing: [String] = []
+        while existing.path != "/", !FileManager.default.fileExists(atPath: existing.path) {
+            missing.insert(existing.lastPathComponent, at: 0)
+            existing.deleteLastPathComponent()
+        }
+        return missing.reduce(existing.resolvingSymlinksInPath()) { $0.appendingPathComponent($1) }.path
     }
 
     private static func line(_ data: Data) throws -> String {
@@ -407,6 +420,10 @@ public struct GitService: Sendable {
         defer { try? FileManager.default.removeItem(at: errors) }
         let errorHandle = try FileHandle(forWritingTo: errors)
         defer { try? errorHandle.close() }
+        let errorReader = try FileHandle(forReadingFrom: errors)
+        defer { try? errorReader.close() }
+        // Both ends are open, so unlink now: quitting or crashing mid-command can't strand the file.
+        try? FileManager.default.removeItem(at: errors)
         process.standardOutput = output
         process.standardError = errorHandle
         process.standardInput = FileHandle.nullDevice
@@ -420,7 +437,7 @@ public struct GitService: Sendable {
         stopWatching?()
         if child.wasTerminated, process.terminationStatus != 0 { throw CancellationError() }
         let message = process.terminationStatus == 0
-            ? "" : ((try? String(contentsOf: errors, encoding: .utf8)) ?? "Git failed.")
+            ? "" : (String(data: errorReader.readDataToEndOfFile(), encoding: .utf8) ?? "Git failed.")
         return GitOutput(
             status: process.terminationStatus, output: data,
             message: message.trimmingCharacters(in: .whitespacesAndNewlines)

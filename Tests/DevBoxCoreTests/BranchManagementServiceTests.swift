@@ -13,22 +13,29 @@ private struct ManagementFixture {
         root = project.appendingPathComponent(".build/test-temp/Branch management \(UUID().uuidString)")
         repository = root.appendingPathComponent("checkout")
         server = root.appendingPathComponent("server.git")
-        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
-        try git(["init", "-b", "main"])
-        try git(["config", "user.name", "Committer Example"])
-        try git(["config", "user.email", "committer@example.invalid"])
-        try git(["commit", "--allow-empty", "--author=Different Author <author@example.invalid>", "-m", "Initial"])
-        try git(["init", "--bare", "-b", "main", server.path])
-        try git(["remote", "add", "team/upstream", server.path])
-        try git(["push", "team/upstream", "main"])
-        try git(["symbolic-ref", "refs/remotes/team/upstream/HEAD", "refs/remotes/team/upstream/main"])
+        do {
+            try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+            try git(["init", "-b", "main"])
+            try git(["config", "user.name", "Committer Example"])
+            try git(["config", "user.email", "committer@example.invalid"])
+            try git(["commit", "--allow-empty", "--author=Different Author <author@example.invalid>", "-m", "Initial"])
+            try git(["init", "--bare", "-b", "main", server.path])
+            try git(["remote", "add", "team/upstream", server.path])
+            try git(["push", "team/upstream", "main"])
+            try git(["symbolic-ref", "refs/remotes/team/upstream/HEAD", "refs/remotes/team/upstream/main"])
+        } catch {
+            try? FileManager.default.removeItem(at: root)
+            throw error
+        }
     }
 
     func cleanup() { try? FileManager.default.removeItem(at: root) }
 
     @discardableResult
     func git(_ args: [String], at path: URL? = nil) throws -> String {
-        String(decoding: try GitService.git(["-C", (path ?? repository).path] + args), as: UTF8.self)
+        String(decoding: try GitService.git(
+            ["-C", (path ?? repository).path, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"] + args
+        ), as: UTF8.self)
             .trimmingCharacters(in: .newlines)
     }
 
@@ -259,4 +266,11 @@ private struct ManagementFixture {
     await #expect(throws: (any Error).self) {
         try await BranchManagementService().delete(branch: beforeConfig, project: f.project(), force: true)
     }
+}
+
+@Test func managementFixtureIgnoresTheDevelopersGitSetup() throws {
+    let fixture = try withHostileGitEnvironment { try ManagementFixture() }
+    defer { fixture.cleanup() }
+    try withHostileGitEnvironment { try fixture.git(["commit", "--allow-empty", "-m", "Second"]) }
+    #expect(try fixture.git(["rev-list", "--count", "HEAD"]) == "2")
 }

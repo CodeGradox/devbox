@@ -11,18 +11,25 @@ private struct BranchFixture {
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         root = project.appendingPathComponent(".build/test-temp/Branch inspection \(UUID().uuidString)")
         repository = root.appendingPathComponent("main '\n checkout")
-        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
-        try git(["init", "-b", "main"])
-        try git(["config", "user.name", "DevBox Tests"])
-        try git(["config", "user.email", "tests@example.invalid"])
-        if !unborn { try git(["commit", "--allow-empty", "-m", "Initial"]) }
+        do {
+            try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+            try git(["init", "-b", "main"])
+            try git(["config", "user.name", "DevBox Tests"])
+            try git(["config", "user.email", "tests@example.invalid"])
+            if !unborn { try git(["commit", "--allow-empty", "-m", "Initial"]) }
+        } catch {
+            try? FileManager.default.removeItem(at: root)
+            throw error
+        }
     }
 
     func cleanup() { try? FileManager.default.removeItem(at: root) }
 
     @discardableResult
     func git(_ arguments: [String], at directory: URL? = nil) throws -> String {
-        String(decoding: try GitService.git(["-C", (directory ?? repository).path] + arguments), as: UTF8.self)
+        String(decoding: try GitService.git(
+            ["-C", (directory ?? repository).path, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"] + arguments
+        ), as: UTF8.self)
             .trimmingCharacters(in: .newlines)
     }
 
@@ -191,4 +198,11 @@ private struct BranchFixture {
     } catch is CancellationError {
         // Cancellation is not converted into an unknown result.
     }
+}
+
+@Test func branchFixtureIgnoresTheDevelopersGitSetup() throws {
+    let fixture = try withHostileGitEnvironment { try BranchFixture() }
+    defer { fixture.cleanup() }
+    try withHostileGitEnvironment { try fixture.git(["commit", "--allow-empty", "-m", "Second"]) }
+    #expect(try fixture.git(["rev-list", "--count", "HEAD"]) == "2")
 }

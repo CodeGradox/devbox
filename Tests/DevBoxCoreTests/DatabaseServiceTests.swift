@@ -38,6 +38,15 @@ final class DatabaseServiceTests: XCTestCase {
         XCTAssertThrowsError(try DatabaseService.validate(settings: .init(), password: "secret\0suffix"))
     }
 
+    func testIdentifierQuotingIsLiteralForCombiningMarksAndCompatibilityBackticks() throws {
+        func scalars(_ text: String) -> [UInt32] { text.unicodeScalars.map(\.value) }
+        // A backtick followed by a combining accent is still a backtick to the server.
+        XCTAssertEqual(scalars(try DatabaseService.quotedIdentifier("a`\u{301}b")), scalars("`a``\u{301}b`"))
+        XCTAssertEqual(scalars(try DatabaseService.quotedIdentifier("`")), [0x60, 0x60, 0x60, 0x60])
+        // U+1FEF is canonically equivalent to a backtick, but is a different character in a name.
+        XCTAssertEqual(scalars(try DatabaseService.quotedIdentifier("a\u{1FEF}b")), scalars("`a\u{1FEF}b`"))
+    }
+
     func testIdentifierQuoting() throws {
         XCTAssertEqual(try DatabaseService.quotedIdentifier("example"), "`example`")
         XCTAssertEqual(try DatabaseService.quotedIdentifier("a`b"), "`a``b`")
