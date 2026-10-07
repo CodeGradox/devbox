@@ -36,6 +36,7 @@ struct EditorLauncher {
     private let describeApplication: @MainActor (URL) -> EditorApplication?
     private let findApplication: @MainActor (String) -> URL?
     private let openURLs: @MainActor ([URL], URL, NSWorkspace.OpenConfiguration) async throws -> Void
+    private let loadIcon: @MainActor (URL) -> NSImage
 
     init(
         findApplications: @escaping @MainActor () -> [URL] = {
@@ -49,13 +50,17 @@ struct EditorLauncher {
         },
         openURLs: @escaping @MainActor ([URL], URL, NSWorkspace.OpenConfiguration) async throws -> Void = {
             _ = try await NSWorkspace.shared.open($0, withApplicationAt: $1, configuration: $2)
-        }
+        },
+        icon: @escaping @MainActor (URL) -> NSImage = { NSWorkspace.shared.icon(forFile: $0.path) }
     ) {
         self.findApplications = findApplications
         self.describeApplication = describeApplication
         self.findApplication = findApplication
         self.openURLs = openURLs
+        self.loadIcon = icon
     }
+
+    func icon(for application: EditorApplication) -> NSImage { loadIcon(application.url) }
 
     func applicationsForFolders() -> [EditorApplication] {
         var seen: Set<URL> = []
@@ -93,7 +98,10 @@ struct EditorLauncher {
         return self.application(withBundleIdentifier: identifier)
     }
 
-    private static func describeInstalledApplication(at url: URL) -> EditorApplication? {
+    private static func describeInstalledApplication(at candidate: URL) -> EditorApplication? {
+        // An open panel can return a symlink to an app, which reports neither as an application
+        // nor as a directory. Describe the bundle it points to.
+        let url = candidate.isFileURL ? candidate.resolvingSymlinksInPath() : candidate
         // Bundle(url:) caches metadata by path, even after another app replaces it.
         // Read identity and executable metadata afresh before trusting a saved location.
         let contents = url.appendingPathComponent("Contents", isDirectory: true)

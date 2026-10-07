@@ -57,7 +57,7 @@ struct ProjectSizePresentation: Equatable {
         if state != .complete {
             text += "\nThis is not a complete fresh total: measurements are pending, unavailable, partial, or being refreshed."
         }
-        if let date = overview.gitMeasuredAt { text += "\nGit storage measured \(date.formatted())." }
+        if let date = overview.gitMeasuredAt { text += "\nGit storage measured \(date.formatted(date: .abbreviated, time: .standard))." }
         if let error = overview.gitUsageError { text += "\nGit storage: \(error)" }
         help = text + "\nAllocated bytes are not a guarantee of reclaimable APFS space."
     }

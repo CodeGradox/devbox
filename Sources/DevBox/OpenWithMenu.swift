@@ -15,7 +15,7 @@ struct OpenWithMenu: View {
                     Label {
                         Text(application.name)
                     } icon: {
-                        Image(nsImage: Self.menuIcon(NSWorkspace.shared.icon(forFile: application.url.path)))
+                        Image(nsImage: store.editorIcon(for: application))
                     }
                 }
             }

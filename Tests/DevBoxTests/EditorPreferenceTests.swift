@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import DevBox
@@ -48,6 +49,8 @@ private final class EditorPreferenceFixture {
     var chosenURL: URL?
     var onChoose: (() -> Void)?
     var chooserCalls = 0
+    var discoveries = 0
+    var iconLoads = 0
     var launches: [(path: String, application: EditorApplication)] = []
     var failLaunch = false
 
@@ -59,7 +62,10 @@ private final class EditorPreferenceFixture {
 
     func makeStore() -> AppStore {
         let launcher = EditorLauncher(
-            findApplications: { self.advertised.map(\.url) },
+            findApplications: {
+                self.discoveries += 1
+                return self.advertised.map(\.url)
+            },
             describeApplication: { url in self.installed.first { $0.url == url } },
             findApplication: { identifier in
                 self.installed.first { $0.bundleIdentifier == identifier }?.url
@@ -67,6 +73,10 @@ private final class EditorPreferenceFixture {
             openURLs: { _, _, _ in
                 Issue.record("AppStore should use the injected launch operation.")
                 throw EditorPreferenceFailure.expected
+            },
+            icon: { _ in
+                self.iconLoads += 1
+                return NSImage(size: NSSize(width: 64, height: 64))
             }
         )
         let store = AppStore(
@@ -320,4 +330,43 @@ func editorMenuRefreshKeepsMissingPreferredNameWithoutFallingBackToZed() async {
     #expect(fixture.chooserCalls == 0)
     #expect(fixture.persistence.writes == 0)
     #expect(store.errorMessage?.contains("Writer") == true)
+}
+
+@Test @MainActor
+func activationRefreshesEditorsAtMostOncePerIntervalWhileOtherRefreshesAlwaysRun() {
+    let fixture = EditorPreferenceFixture()
+    fixture.installed = [fixture.generic]
+    fixture.advertised = [fixture.generic]
+    let store = fixture.makeStore()
+    let afterLaunch = fixture.discoveries
+    #expect(afterLaunch >= 1) // The initializer discovers once.
+
+    store.refreshEditorApplications(ifOlderThan: 10, now: Date())
+    #expect(fixture.discoveries == afterLaunch) // Just discovered: nothing to do.
+    store.refreshEditorApplications(ifOlderThan: 10, now: Date().addingTimeInterval(11))
+    #expect(fixture.discoveries == afterLaunch + 1)
+    store.refreshEditorApplications(ifOlderThan: 10, now: Date().addingTimeInterval(12))
+    #expect(fixture.discoveries == afterLaunch + 1) // One second after the last.
+    // A preference change, or any caller without an interval, always looks again.
+    store.refreshEditorApplications()
+    #expect(fixture.discoveries == afterLaunch + 2)
+}
+
+@Test @MainActor
+func openWithIconsAreLoadedOncePerApplicationUntilTheListChanges() {
+    let fixture = EditorPreferenceFixture()
+    fixture.installed = [fixture.generic]
+    fixture.advertised = [fixture.generic]
+    let store = fixture.makeStore()
+    for _ in 0..<5 { _ = store.editorIcon(for: fixture.generic) }
+    #expect(fixture.iconLoads == 1)
+    #expect(store.editorIcon(for: fixture.generic).size == NSSize(width: 16, height: 16))
+
+    fixture.installed = [fixture.generic, fixture.zed]
+    fixture.advertised = [fixture.generic, fixture.zed]
+    store.refreshEditorApplications()
+    _ = store.editorIcon(for: fixture.generic)
+    _ = store.editorIcon(for: fixture.zed)
+    _ = store.editorIcon(for: fixture.zed)
+    #expect(fixture.iconLoads == 3) // generic again after the list changed, and zed once.
 }

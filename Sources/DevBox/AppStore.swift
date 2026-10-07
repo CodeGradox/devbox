@@ -228,6 +228,8 @@ final class AppStore {
     @ObservationIgnored private var pullRequestTask: Task<Void, Never>?
     @ObservationIgnored private var generation = UUID()
     @ObservationIgnored private var settingsReadable = true
+    @ObservationIgnored private var editorsRefreshedAt: Date?
+    @ObservationIgnored private var editorIcons: [URL: NSImage] = [:]
     private var queuedSheet: AppSheet?
     // The session models are the cache, not duplicate active/cache arrays.
     private var projectSessions: [String: ProjectSessionState] = [:]
@@ -252,6 +254,7 @@ final class AppStore {
     var isModalPresented: Bool { activeSheet != nil || queuedSheet != nil || isChoosingEditor }
 
     func sheetDidDismiss() {
+        resumeInterruptedScans()
         guard let next = queuedSheet else { return }
         queuedSheet = nil
         activeSheet = next
@@ -385,9 +388,12 @@ final class AppStore {
         preferredEditor.map { "Open in \($0.name)" } ?? "Open in Editor…"
     }
 
-    /// Discover outside view bodies, at launch and when returning to DevBox.
+    /// Discover outside view bodies, at launch and when returning to DevBox. Pass `ifOlderThan`
+    /// for frequent triggers, which then skip the work if it ran that recently.
     /// A manually chosen app remains available even if it does not advertise folder support.
-    func refreshEditorApplications() {
+    func refreshEditorApplications(ifOlderThan interval: TimeInterval = 0, now: Date = Date()) {
+        if interval > 0, let last = editorsRefreshedAt, now.timeIntervalSince(last) < interval { return }
+        editorsRefreshedAt = now
         // A preference saved before Archive Utility was filtered out of the menu is ignored,
         // not rewritten, so the toolbar can't keep archiving folders.
         if let saved = settings.preferredEditor, !saved.archivesFolders {
@@ -400,7 +406,18 @@ final class AppStore {
            !applications.contains(where: { $0.id == installed.id }) {
             applications.insert(installed, at: 0)
         }
-        if editorApplications != applications { editorApplications = applications }
+        if editorApplications != applications {
+            editorApplications = applications
+            editorIcons = [:]
+        }
+    }
+
+    /// Menus rebuild their items whenever anything they read changes, so icons are looked up once.
+    func editorIcon(for application: EditorApplication) -> NSImage {
+        if let cached = editorIcons[application.url] { return cached }
+        let icon = OpenWithMenu.menuIcon(editorLauncher.icon(for: application))
+        editorIcons[application.url] = icon
+        return icon
     }
 
     func canOpenInEditor(_ ids: Set<String>) -> Bool {
@@ -448,7 +465,9 @@ final class AppStore {
     }
 
     private func worktreeToOpenInEditor(_ ids: Set<String>) -> WorktreeRecord? {
+        // After a failed refresh the table is replaced by an error, so its rows can't be acted on.
         guard projectSection == .worktrees, !isDeleting, !isModalPresented, ids.count == 1,
+              selectedProjectSession?.worktreeLoading.error == nil,
               let id = ids.first, let worktree = selectedProjectSession?.row(id: id)?.row.worktree,
               worktree.exists, !worktree.isBare else { return nil }
         return worktree
@@ -474,14 +493,6 @@ final class AppStore {
         for session in databaseSessions.values { session.refreshPresentation() }
     }
 
-    func sizeSummary(for project: ProjectRecord) -> ProjectSizeSummary? {
-        projectSessions[project.id]?.summary
-    }
-
-    var sizeProgressText: String {
-        selectedProjectSession?.sizeProgressText ?? ""
-    }
-
     var canDeleteSelection: Bool {
         guard !isRefreshing, !isDeleting, !isModalPresented,
               selectedProjectSession?.isFetchingBranches != true else { return false }
@@ -490,6 +501,9 @@ final class AppStore {
                 guard selectedProjectSession?.branchList.hasLoadedInventory == true else { return false }
                 return !selectedBranches.isEmpty && selectedBranches.allSatisfy { $0.protectedReason == nil }
             }
+            // As for branches and databases, only a loaded inventory can be deleted from. After a
+            // failed refresh the retained selection is hidden behind the error.
+            guard selectedProjectSession?.hasLoadedInventory == true else { return false }
             let selection = selectedWorktrees
             return !selection.isEmpty && selection.allSatisfy { $0.protectedReason == nil }
         }
@@ -581,6 +595,8 @@ final class AppStore {
         // A changed endpoint or credential must never reuse the old server's metadata.
         databaseSessions[connection.id] = DatabaseSessionState()
         if destination == .connection(connection.id) {
+            // The destination is unchanged, so its didSet won't drop a selection made on the old endpoint.
+            databaseSelection = []
             loadSelection()
         } else {
             destination = .connection(connection.id)
@@ -720,6 +736,28 @@ final class AppStore {
         } catch { errorMessage = error.localizedDescription }
     }
 
+    /// The recorded path is where the project was added from. If that was a linked worktree that has
+    /// since been deleted, point at the main checkout instead of a folder that no longer exists.
+    private func healMissingProjectPath(_ project: ProjectRecord, records: [WorktreeRecord]) {
+        guard settingsReadable, !FileManager.default.fileExists(atPath: project.path),
+              let main = records.first(where: { $0.isMain && !$0.isBare && $0.exists }),
+              let index = settings.projects.firstIndex(where: { $0.id == project.id }) else { return }
+        var next = settings
+        next.projects[index] = ProjectRecord(
+            id: project.id, name: project.name, path: main.path, mergeTarget: project.mergeTarget
+        )
+        // Cosmetic: if the write fails, the old path just stays until the next load.
+        try? persist(next)
+    }
+
+    /// Opening a deletion confirmation stops the selected rows' size scans. Cancelling it, or a
+    /// deletion that left rows behind, must not leave them unmeasured until the next refresh.
+    private func resumeInterruptedScans() {
+        guard !isDeleting, projectSection == .worktrees, let project = selectedProject,
+              let session = selectedProjectSession, session.hasLoadedInventory else { return }
+        loadWorktrees(project, session: session, useCache: true)
+    }
+
     /// Tabs express demand; the project session, not a view, owns ongoing jobs.
     private func ensureProjectSectionLoaded() {
         guard !isDeleting, let project = selectedProject, let session = selectedProjectSession else { return }
@@ -836,6 +874,7 @@ final class AppStore {
                 let records = try await listWorktrees(project)
                 guard loading.accepts(token), !Task.isCancelled else { return }
                 let currentProject = settings.projects.first { $0.id == project.id } ?? project
+                healMissingProjectPath(currentProject, records: records)
                 // Both the worktree inventory and merge target are inspection
                 // inputs. Fence an inspection started before this reconciliation.
                 session.inspectionLoading.cancel()
@@ -1178,6 +1217,14 @@ final class AppStore {
             session?.updateOverview { $0.branches = nil; $0.branchError = nil }
         case .databases(let connection, _):
             databaseSessions[connection.id]?.removeConfirmedDatabases(ids: completed)
+            // An uncertain DROP may or may not have happened. Don't keep offering that row for
+            // deletion until a refresh has said which.
+            if deletionEntries.contains(where: {
+                if case .uncertain = $0.state { return true }
+                return false
+            }) {
+                databaseSessions[connection.id]?.invalidateInventory()
+            }
         }
         deletionProgressText = ""
         worktreeSelection = []
@@ -1186,6 +1233,15 @@ final class AppStore {
         queuedSheet = .results(.init(title: "Deletion Results", entries: deletionEntries))
         deletionRequest = nil
         isDeleting = false
+        // The sidebar may have moved on while loadSelection() was refusing to run.
+        if selectionIsStale { loadSelection() }
+    }
+
+    /// loadSelection() does nothing during a deletion, so a destination change made then
+    /// (for example by Add Project finishing) leaves the previous session on screen.
+    private var selectionIsStale: Bool {
+        selectedProjectSession !== selectedProject.flatMap { projectSessions[$0.id] }
+            || selectedDatabaseSession !== selectedConnection.flatMap { databaseSessions[$0.id] }
     }
 
     private func runDeletionBatch(_ operation: @MainActor (Int) async throws -> Void) async {

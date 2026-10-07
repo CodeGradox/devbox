@@ -1,5 +1,6 @@
 import Observation
 import Foundation
+import Synchronization
 import Testing
 @testable import DevBox
 @testable import DevBoxCore
@@ -271,19 +272,25 @@ private struct StoreGitFixture {
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         root = project.appendingPathComponent(".build/test-temp/size-ui-\(UUID())")
         repository = root.appendingPathComponent("main")
-        try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
-        try git(["init", "-b", "main"])
-        try git(["-c", "user.name=Tests", "-c", "user.email=tests@example.invalid",
-                 "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Initial"])
-        try git(["worktree", "add", "-b", "feature", root.appendingPathComponent("linked").path])
+        do {
+            try FileManager.default.createDirectory(at: repository, withIntermediateDirectories: true)
+            try git(["init", "-b", "main"])
+            try git(["-c", "user.name=Tests", "-c", "user.email=tests@example.invalid",
+                     "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Initial"])
+            try git(["worktree", "add", "-b", "feature", root.appendingPathComponent("linked").path])
+        } catch {
+            try? FileManager.default.removeItem(at: root)
+            throw error
+        }
     }
 
     func cleanup() { try? FileManager.default.removeItem(at: root) }
 
-    private func git(_ arguments: [String]) throws {
+    func git(_ arguments: [String]) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = ["-C", repository.path, "-c", "core.hooksPath=/dev/null"] + arguments
+        process.environment = GitService.environment(from: ProcessInfo.processInfo.environment)
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         try process.run()
@@ -608,4 +615,248 @@ func duplicateIdsInSettingsAreCollapsedInsteadOfCrashingAtLaunch() {
     #expect(store.projectSession(for: first) != nil)
     #expect(store.destination == .project("same"))
     #expect(store.errorMessage == nil)
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func launchLoadsTheRestoredSelectionExactlyOnce() async throws {
+    // The initializer starts the load for a restored selection, so the window doesn't ask again.
+    let persistence = MemorySettings()
+    persistence.value.projects = [ProjectRecord(id: "restored", name: "Restored", path: "/unused")]
+    let calls = Mutex(0)
+    let store = AppStore(
+        persistence: persistence, credentials: MemoryCredentials(),
+        listWorktrees: { _ in calls.withLock { $0 += 1 }; return [] },
+        editorLauncher: inertEditorLauncher()
+    )
+    #expect(store.isRefreshing)
+    await waitForGitStatus(store)
+    #expect(calls.withLock { $0 } == 1)
+    #expect(store.worktrees.isEmpty)
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func cancellingTheDeletionSheetResumesTheScansItStopped() async throws {
+    let fixture = try StoreGitFixture()
+    defer { fixture.cleanup() }
+    let persistence = MemorySettings()
+    persistence.value.projects = [try await GitService().discoverProject(at: fixture.repository.path)]
+    let probe = StoreSizeProbe()
+    await probe.hold()
+    let store = AppStore(
+        persistence: persistence, credentials: MemoryCredentials(),
+        sizeQueue: WorktreeSizeQueue(scan: { try await probe.scan($0) }),
+        editorLauncher: inertEditorLauncher()
+    )
+    store.refresh()
+    await waitForGitStatus(store)
+    let linked = try #require(store.worktrees.first { !$0.worktree.isMain })
+    store.worktreeSelection = [linked.id]
+    store.prepareDeletion()
+    #expect(store.worktrees.first { $0.id == linked.id }?.sizeState == .idle)
+    await probe.release()
+    await waitForSizes(store)
+    #expect(store.worktrees.first { $0.id == linked.id }?.usage == nil)
+
+    let scansBefore = await probe.count(for: linked.id)
+    store.deletionRequest = nil // Cancel.
+    store.sheetDidDismiss()
+    await waitForSizes(store)
+
+    let measured = try #require(store.worktrees.first { $0.id == linked.id })
+    #expect(measured.usage != nil)
+    #expect(!measured.sizeRefreshPending)
+    #expect(await probe.count(for: linked.id) == scansBefore + 1)
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func destinationChangedDuringDeletionIsAppliedWhenItEnds() async throws {
+    let persistence = MemorySettings()
+    let credentials = MemoryCredentials()
+    let first = SavedConnection(name: "First", settings: .init(port: 3306))
+    let second = SavedConnection(name: "Second", settings: .init(port: 3307))
+    persistence.value.connections = [first, second]
+    credentials.values = [first.id: "synthetic", second.id: "synthetic"]
+    let gate = GitHubTestGate<Void>()
+    let store = AppStore(
+        persistence: persistence, credentials: credentials,
+        dropDatabase: { _, _, _ in },
+        listDatabases: { settings, _ in [DatabaseRecord(name: settings.port == 3306 ? "first_db" : "second_db")] },
+        loadStatistics: { _, _ in [:] },
+        editorLauncher: inertEditorLauncher(),
+        authenticate: { _ in await gate.enter() }
+    )
+    for await ready in Observations({ store.selectedDatabaseSession?.hasLoadedInventory == true }) { if ready { break } }
+    store.databaseSelection = ["first_db"]
+    store.prepareDeletion()
+    let request = try #require(store.deletionRequest)
+    let deletion = Task { await store.delete(request) }
+    await gate.waitForEntry()
+    store.destination = .connection(second.id) // For example Add Project finishing mid-deletion.
+    #expect(store.databases.map(\.name) == ["first_db"]) // Still the old session: nothing may load now.
+    await gate.release(())
+    await deletion.value
+    for await ready in Observations({ store.selectedDatabaseSession?.hasLoadedInventory == true }) { if ready { break } }
+    #expect(store.selectedConnection?.id == second.id)
+    #expect(store.databases.map(\.name) == ["second_db"])
+}
+
+@Test @MainActor
+func editingTheSelectedConnectionDropsSelectionsMadeOnItsOldEndpoint() async throws {
+    let persistence = MemorySettings()
+    let credentials = MemoryCredentials()
+    let connection = SavedConnection(name: "Local", settings: .init(port: 3306))
+    persistence.value.connections = [connection]
+    credentials.values[connection.id] = "synthetic"
+    let store = AppStore(
+        persistence: persistence, credentials: credentials,
+        listDatabases: { _, _ in [DatabaseRecord(name: "old_endpoint_db")] }, loadStatistics: { _, _ in [:] },
+        editorLauncher: inertEditorLauncher()
+    )
+    #expect(store.destination == .connection(connection.id))
+    store.databaseSelection = ["old_endpoint_db"]
+    var moved = connection
+    moved.settings.port = 3307
+
+    try await store.saveConnection(moved, password: "synthetic")
+
+    #expect(store.databaseSelection.isEmpty)
+    #expect(store.destination == .connection(connection.id))
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func rowsHiddenBehindAFailedRefreshCannotBeDeletedOrOpened() async throws {
+    let fixture = try StoreGitFixture()
+    defer { fixture.cleanup() }
+    let persistence = MemorySettings()
+    persistence.value.projects = [try await GitService().discoverProject(at: fixture.repository.path)]
+    let failing = Mutex(false)
+    let store = AppStore(
+        persistence: persistence, credentials: MemoryCredentials(),
+        sizeQueue: WorktreeSizeQueue(scan: { _ in DiskUsage(bytes: 0, fileCount: 0, unreadableCount: 0) }),
+        listWorktrees: { project in
+            if failing.withLock({ $0 }) { throw TestFailure.expected }
+            return try await GitService().listWorktrees(project: project)
+        },
+        editorLauncher: inertEditorLauncher()
+    )
+    store.refresh()
+    await waitForGitStatus(store)
+    let linked = try #require(store.worktrees.first { !$0.worktree.isMain })
+    store.worktreeSelection = [linked.id]
+    #expect(store.canDeleteSelection)
+    #expect(store.canOpenInEditor([linked.id]))
+
+    failing.withLock { $0 = true }
+    store.refresh()
+    await waitForGitStatus(store)
+
+    #expect(store.loadError != nil)
+    #expect(store.worktreeSelection == [linked.id]) // The selection is retained, but its rows are hidden.
+    #expect(!store.canDeleteSelection)
+    #expect(!store.canOpenInEditor([linked.id]))
+}
+
+@Test @MainActor
+func repositoryFixtureIgnoresAnInheritedGitDir() throws {
+    setenv("GIT_DIR", "/nonexistent/devbox-git-dir", 1)
+    defer { unsetenv("GIT_DIR") }
+    let fixture = try StoreGitFixture()
+    defer { fixture.cleanup() }
+    #expect(FileManager.default.fileExists(atPath: fixture.repository.appendingPathComponent(".git").path))
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func protectedWorktreesAreNeverOfferedForDeletion() async throws {
+    let fixture = try StoreGitFixture()
+    defer { fixture.cleanup() }
+    let (store, linked) = try await loadedStore(fixture)
+    let main = try #require(store.worktrees.first { $0.worktree.isMain })
+    #expect(main.protectedReason != nil)
+
+    store.worktreeSelection = [main.id]
+    #expect(!store.canDeleteSelection)
+    store.prepareDeletion()
+    #expect(store.deletionRequest == nil)
+    // One protected row blocks the whole batch.
+    store.worktreeSelection = [main.id, linked.id]
+    #expect(!store.canDeleteSelection)
+
+    try fixture.git(["worktree", "lock", "--reason", "busy", linked.worktree.path])
+    store.refresh()
+    await waitForGitStatus(store)
+    store.worktreeSelection = [linked.id]
+    let locked = try #require(store.worktrees.first { $0.id == linked.id })
+    #expect(locked.protectedReason?.contains("Unlock") == true)
+    #expect(!store.canDeleteSelection)
+    store.prepareDeletion()
+    #expect(store.deletionRequest == nil)
+
+    try fixture.git(["worktree", "unlock", linked.worktree.path])
+    store.refresh()
+    await waitForGitStatus(store)
+    store.worktreeSelection = [linked.id]
+    #expect(store.canDeleteSelection)
+    store.prepareDeletion()
+    #expect(store.deletionRequest?.count == 1)
+}
+
+@MainActor
+private func projectStore(
+    _ persistence: MemorySettings, mainCheckout: URL
+) -> AppStore {
+    AppStore(
+        persistence: persistence, credentials: MemoryCredentials(),
+        sizeQueue: WorktreeSizeQueue(
+            scan: { _ in DiskUsage(bytes: 0, fileCount: 0, unreadableCount: 0) },
+            gitStorageScan: { _ in DiskUsage(bytes: 0, fileCount: 0, unreadableCount: 0) }
+        ),
+        inspectBranches: { _, _ in throw TestFailure.expected },
+        listWorktrees: { _ in
+            [WorktreeRecord(path: mainCheckout.path, branch: "main", head: "abc", isMain: true)]
+        },
+        loadGitStatus: { _ in throw TestFailure.expected },
+        editorLauncher: inertEditorLauncher()
+    )
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func projectPathOfADeletedWorktreeIsReplacedByTheMainCheckout() async throws {
+    let main = FileManager.default.temporaryDirectory.appendingPathComponent("devbox-main-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: main, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: main) }
+    let persistence = MemorySettings()
+    // Added from a linked worktree that has since been deleted.
+    persistence.value.projects = [ProjectRecord(
+        id: "p", name: "P", path: "/does/not/exist/deleted-worktree", mergeTarget: "refs/heads/main"
+    )]
+    let store = projectStore(persistence, mainCheckout: main)
+    await waitForGitStatus(store)
+    #expect(store.settings.projects.first?.path == main.path)
+    #expect(persistence.value.projects.first?.path == main.path)
+    #expect(persistence.value.projects.first?.mergeTarget == "refs/heads/main")
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func projectPathThatStillExistsIsLeftAlone() async throws {
+    let main = FileManager.default.temporaryDirectory.appendingPathComponent("devbox-main-\(UUID().uuidString)")
+    let linked = FileManager.default.temporaryDirectory.appendingPathComponent("devbox-linked-\(UUID().uuidString)")
+    for directory in [main, linked] { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+    defer { for directory in [main, linked] { try? FileManager.default.removeItem(at: directory) } }
+    let persistence = MemorySettings()
+    persistence.value.projects = [ProjectRecord(id: "p", name: "P", path: linked.path)]
+    let store = projectStore(persistence, mainCheckout: main)
+    await waitForGitStatus(store)
+    #expect(store.settings.projects.first?.path == linked.path)
+    #expect(persistence.writes == 0)
+}
+
+@Test
+func gitStorageTooltipUsesTheSameDateStyleAsTheOtherMeasurementTooltips() {
+    let measured = Date(timeIntervalSince1970: 1_700_000_000)
+    var overview = ProjectOverview()
+    overview.gitMeasuredAt = measured
+    let presentation = ProjectSizePresentation(
+        summary: ProjectSizeSummary(rows: [WorktreeRow](), overview: overview), overview: overview
+    )
+    #expect(presentation.help.contains(measured.formatted(date: .abbreviated, time: .standard)))
 }

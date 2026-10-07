@@ -131,7 +131,6 @@ final class DatabaseSessionState {
     private(set) var isLoadingStatistics = false
     private(set) var statisticsRefreshPending = false
     private(set) var statisticsError: String?
-    private(set) var measuredAt: Date?
     private(set) var summary = DatabaseSizeSummary([DatabaseRowState]())
     @ObservationIgnored private var byID: [String: DatabaseRowState] = [:]
 
@@ -179,7 +178,6 @@ final class DatabaseSessionState {
                 row.fail("This database was not present in the metadata response. Refresh to try again.")
             }
         }
-        measuredAt = date
         statisticsError = nil
         isLoadingStatistics = false
         statisticsRefreshPending = false

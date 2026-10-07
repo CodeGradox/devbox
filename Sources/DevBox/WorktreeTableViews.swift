@@ -139,6 +139,7 @@ struct WorktreeContextMenu: View {
             Button("Open in Finder") { [path = row.worktree.path] in
                 NSWorkspace.shared.open(URL(fileURLWithPath: path))
             }
+            .disabled(!row.worktree.exists)
             Button("Copy Path") { [path = row.worktree.path] in
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(path, forType: .string)

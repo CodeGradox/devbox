@@ -35,6 +35,24 @@ struct EditorLauncherTests {
     }
 
     @Test
+    func symlinkedApplicationBundleIsDescribedByTheBundleItPointsTo() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture) }
+        let real = fixture.appendingPathComponent("Real.app", isDirectory: true)
+        try makeApplication(at: real, name: "Real", identifier: "example.real")
+        // An open panel can hand back the link, as when an app is aliased into another folder.
+        let link = fixture.appendingPathComponent("Alias.app", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: real)
+        let launcher = EditorLauncher(findApplications: { [] })
+
+        let described = try #require(launcher.application(at: link))
+
+        #expect(described.name == "Real")
+        #expect(described.bundleIdentifier == "example.real")
+        #expect(described.url.path == real.resolvingSymlinksInPath().path)
+    }
+
+    @Test
     func realBundleReplacementDoesNotReuseCachedIdentityOrExecutable() async throws {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture) }

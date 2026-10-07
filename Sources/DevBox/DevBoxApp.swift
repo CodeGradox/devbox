@@ -18,11 +18,11 @@ struct DevBoxApp: App {
                 }
                 .task {
                     delegate.store = store
-                    store.loadSelection()
                     await store.github.restoreIfNeeded()
                 }
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-                    store.refreshEditorApplications()
+                    // Activation is frequent; discovery costs a LaunchServices query and a plist read per app.
+                    store.refreshEditorApplications(ifOlderThan: 10)
                 }
         }
         .defaultSize(width: 1140, height: 720)
@@ -50,7 +50,6 @@ private struct DevBoxCommands: Commands {
             Button("GitHub Account…") { store.activeSheet = .github() }
                 .disabled(store.isDeleting || store.isModalPresented)
         }
-        CommandGroup(replacing: .undoRedo) {}
         CommandGroup(after: .toolbar) {
             Menu("Appearance") {
                 Picker("Appearance", selection: $theme) {

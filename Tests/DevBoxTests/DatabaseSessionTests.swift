@@ -299,6 +299,48 @@ struct DatabaseSessionTests {
     }
 
     @Test
+    func uncertainDropKeepsTheRowButRequiresARefreshBeforeAnotherDeletion() async throws {
+        let settings = DatabaseMemorySettings()
+        settings.value.connections = [SavedConnection(name: "Test", settings: .init())]
+        let store = AppStore(
+            persistence: settings, credentials: DatabaseMemoryCredentials(),
+            dropDatabase: { _, _, _ in throw DatabaseServiceError.deletionOutcomeUnknown(code: 2013) },
+            listDatabases: { _, _ in [DatabaseRecord(name: "app"), DatabaseRecord(name: "other")] },
+            loadStatistics: { _, _ in ["app": databaseEstimate(1), "other": databaseEstimate(1)] },
+            editorLauncher: inertEditorLauncher(),
+            authenticate: { _ in }
+        )
+        store.loadSelection()
+        let session = try #require(store.selectedDatabaseSession)
+        for await ready in Observations({ session.hasLoadedInventory && !session.statisticsRefreshPending }) {
+            if ready { break }
+        }
+        store.databaseSelection = ["app"]
+        store.prepareDeletion()
+        let request = try #require(store.deletionRequest)
+        await store.delete(request)
+        guard case .uncertain = store.deletionEntries[0].state else {
+            Issue.record("The lost reply must be reported as uncertain")
+            return
+        }
+        store.sheetDidDismiss() // Show, then close, the results so no modal gets in the way.
+        store.activeSheet = nil
+        // The server may or may not have dropped it, and the message says to refresh first.
+        #expect(store.databases.map(\.name) == ["app", "other"])
+        #expect(!session.hasLoadedInventory)
+        store.databaseSelection = ["app"]
+        #expect(!store.isModalPresented)
+        #expect(!store.canDeleteSelection)
+
+        store.refresh()
+        for await ready in Observations({ session.hasLoadedInventory && !store.isRefreshing }) {
+            if ready { break }
+        }
+        store.databaseSelection = ["app"]
+        #expect(store.canDeleteSelection)
+    }
+
+    @Test
     func completingMetadataDoesNotClearActiveDeletionProgress() async throws {
         let settings = DatabaseMemorySettings()
         settings.value.connections = [SavedConnection(name: "Test", settings: .init())]
