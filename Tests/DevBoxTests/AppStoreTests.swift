@@ -507,3 +507,105 @@ func slowSizeScansDoNotBlockGitRefreshOrDeletionConfirmation() async throws {
     #expect(store.worktrees.first { $0.id == linked.id }?.usage == nil)
     #expect(FileManager.default.fileExists(atPath: linked.worktree.path))
 }
+
+@MainActor
+private func deletionResult(of store: AppStore) throws -> [OperationResult.Entry] {
+    store.sheetDidDismiss()
+    guard case .results(let result) = store.activeSheet else {
+        Issue.record("Expected deletion results")
+        return []
+    }
+    return result.entries
+}
+
+@MainActor
+private func loadedStore(_ fixture: StoreGitFixture) async throws -> (AppStore, WorktreeRow) {
+    let persistence = MemorySettings()
+    persistence.value.projects = [try await GitService().discoverProject(at: fixture.repository.path)]
+    let store = AppStore(
+        persistence: persistence, credentials: MemoryCredentials(),
+        sizeQueue: WorktreeSizeQueue(scan: { _ in DiskUsage(bytes: 0, fileCount: 0, unreadableCount: 0) }),
+        editorLauncher: inertEditorLauncher(), authenticate: { _ in }
+    )
+    store.refresh()
+    await waitForGitStatus(store)
+    return (store, try #require(store.worktrees.first { !$0.worktree.isMain }))
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func deletionKeepsChangesMadeAfterTheSheetShowedACleanWorktree() async throws {
+    let fixture = try StoreGitFixture()
+    defer { fixture.cleanup() }
+    let (store, linked) = try await loadedStore(fixture)
+    #expect(linked.status?.isClean == true)
+    store.worktreeSelection = [linked.id]
+    store.prepareDeletion()
+    let request = try #require(store.deletionRequest)
+    // Work saved between reviewing the confirmation and confirming it.
+    let edit = URL(fileURLWithPath: linked.worktree.path).appendingPathComponent("unsaved.txt")
+    try Data("hours of work".utf8).write(to: edit)
+
+    await store.delete(request)
+
+    #expect(try String(contentsOf: edit, encoding: .utf8) == "hours of work")
+    let entries = try deletionResult(of: store)
+    #expect(entries.count == 1)
+    guard case .failed(let message) = entries[0].state else {
+        Issue.record("A worktree that changed after review must fail, not be deleted: \(entries[0].state)")
+        return
+    }
+    #expect(message.contains("uncommitted changes"))
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func deletionStillRemovesWorktreeShownWithUncommittedChanges() async throws {
+    let fixture = try StoreGitFixture()
+    defer { fixture.cleanup() }
+    try Data("dirty".utf8).write(to: fixture.root.appendingPathComponent("linked/unsaved.txt"))
+    let (store, linked) = try await loadedStore(fixture)
+    #expect(linked.status?.isClean == false)
+    store.worktreeSelection = [linked.id]
+    store.prepareDeletion()
+    let request = try #require(store.deletionRequest)
+
+    await store.delete(request)
+
+    #expect(try deletionResult(of: store).map(\.state) == [.completed])
+    #expect(!FileManager.default.fileExists(atPath: linked.worktree.path))
+}
+
+@Test(.timeLimit(.minutes(1))) @MainActor
+func deletionRemovesWorktreeThatIsStillCleanWithoutForce() async throws {
+    let fixture = try StoreGitFixture()
+    defer { fixture.cleanup() }
+    let (store, linked) = try await loadedStore(fixture)
+    store.worktreeSelection = [linked.id]
+    store.prepareDeletion()
+    let request = try #require(store.deletionRequest)
+
+    await store.delete(request)
+
+    #expect(try deletionResult(of: store).map(\.state) == [.completed])
+    #expect(!FileManager.default.fileExists(atPath: linked.worktree.path))
+}
+
+@Test @MainActor
+func duplicateIdsInSettingsAreCollapsedInsteadOfCrashingAtLaunch() {
+    let persistence = MemorySettings()
+    let first = ProjectRecord(id: "same", name: "First", path: "/one")
+    let second = ProjectRecord(id: "same", name: "Second", path: "/two")
+    let connection = SavedConnection(name: "First", settings: .init())
+    var duplicate = SavedConnection(name: "Second", settings: .init())
+    duplicate.id = connection.id
+    persistence.value.projects = [first, second]
+    persistence.value.connections = [connection, duplicate]
+    let store = AppStore(
+        persistence: persistence, credentials: MemoryCredentials(),
+        listWorktrees: { _ in [] }, editorLauncher: inertEditorLauncher()
+    )
+    #expect(store.settings.projects.map(\.name) == ["First"])
+    #expect(store.settings.connections.map(\.name) == ["First"])
+    #expect(store.projectSession(for: first) != nil)
+    #expect(store.destination == .project("same"))
+    #expect(store.errorMessage == nil)
+}

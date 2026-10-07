@@ -371,7 +371,7 @@ func deletionFencesTheOtherTabsInFlightInventory() async throws {
         sizeQueue: WorktreeSizeQueue(scan: { _ in lifecycleUsage }, gitStorageScan: { _ in lifecycleUsage }),
         inspectBranches: { _, _ in BranchInspection(targetLabel: "main", byWorktreeID: [:]) },
         listManagedBranches: { _ in await branches.run() },
-        removeWorktree: { _, _ in },
+        removeWorktree: { _, _, _ in },
         listWorktrees: { _ in [lifecycleRecord] },
         loadGitStatus: { _ in lifecycleStatus },
         editorLauncher: inertEditorLauncher(),

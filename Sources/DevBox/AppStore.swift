@@ -209,7 +209,7 @@ final class AppStore {
     private let credentials: any CredentialsPersisting
     private let authenticate: @MainActor (String) async throws -> Void
     private let dropDatabase: @Sendable (DatabaseRecord, ConnectionSettings, String) async throws -> Void
-    private let removeWorktree: @Sendable (WorktreeRecord, ProjectRecord) async throws -> Void
+    private let removeWorktree: @Sendable (WorktreeRecord, ProjectRecord, Bool) async throws -> Void
     private let listDatabases: @Sendable (ConnectionSettings, String) async throws -> [DatabaseRecord]
     private let loadStatistics: @Sendable (ConnectionSettings, String) async throws -> [String: DatabaseStatistics]
     private let listWorktrees: @Sendable (ProjectRecord) async throws -> [WorktreeRecord]
@@ -275,8 +275,8 @@ final class AppStore {
         dropDatabase: @escaping @Sendable (DatabaseRecord, ConnectionSettings, String) async throws -> Void = {
             try await DatabaseService().dropDatabase($0, settings: $1, password: $2)
         },
-        removeWorktree: @escaping @Sendable (WorktreeRecord, ProjectRecord) async throws -> Void = {
-            try await GitService().remove(worktree: $0, project: $1, allowDirty: true)
+        removeWorktree: @escaping @Sendable (WorktreeRecord, ProjectRecord, Bool) async throws -> Void = {
+            try await GitService().remove(worktree: $0, project: $1, allowDirty: $2)
         },
         listDatabases: @escaping @Sendable (ConnectionSettings, String) async throws -> [DatabaseRecord] = {
             try await DatabaseService().databases(settings: $0, password: $1)
@@ -318,7 +318,14 @@ final class AppStore {
         }
         self.authenticate = authenticate
         do {
-            settings = try persistence.load()
+            var loaded = try persistence.load()
+            // Duplicate ids can only come from a hand-edited or merged file. Keep the first
+            // of each, instead of trapping on every launch.
+            var projectIDs: Set<String> = []
+            loaded.projects = loaded.projects.filter { projectIDs.insert($0.id).inserted }
+            var connectionIDs: Set<UUID> = []
+            loaded.connections = loaded.connections.filter { connectionIDs.insert($0.id).inserted }
+            settings = loaded
             projectSessions = Dictionary(uniqueKeysWithValues: settings.projects.map {
                 ($0.id, ProjectSessionState())
             })
@@ -1124,7 +1131,11 @@ final class AppStore {
         switch request.items {
         case .worktrees(let project, let rows):
             await runDeletionBatch { index in
-                try await removeWorktree(rows[index].worktree, project)
+                // The sheet showed each row's cached status. Only a row shown with changes, or
+                // without a known status, may be forced; anything shown Clean must still be
+                // clean now, so edits made since then are never destroyed unseen.
+                let shownClean = rows[index].status?.isClean == true
+                try await removeWorktree(rows[index].worktree, project, !shownClean)
             }
         case .branches(let project, let rows):
             await runDeletionBatch { index in

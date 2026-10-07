@@ -48,7 +48,7 @@ struct DeletionRenderingTests {
         }
         let store = AppStore(
             persistence: DeletionRenderingSettings(),
-            removeWorktree: { _, _ in
+            removeWorktree: { _, _, _ in
                 signalStarted.yield(())
                 for await _ in finished { break }
             },
